@@ -399,6 +399,16 @@ final class Client
     }
 
     /**
+     * Guzzle middleware for raw Guzzle clients: `$stack->push(ElgioLogger::guzzleMiddleware())`.
+     *
+     * @return callable(callable): callable
+     */
+    public function guzzleMiddleware(): callable
+    {
+        return GuzzleMiddleware::create();
+    }
+
+    /**
      * Join the trace described by an incoming traceparent (queue consumers, broker messages, CLI
      * entry points). HTTP requests do this automatically through the TraceRequests middleware.
      * An invalid or empty value starts a fresh trace. Returns the trace id now in use.

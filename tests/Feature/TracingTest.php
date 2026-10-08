@@ -270,4 +270,55 @@ final class TracingTest extends TestCase
         $this->assertNull(ElgioLogger::traceparent());
         $this->assertSame([], ElgioLogger::traceHeaders());
     }
+
+    /**
+     * @param  list<array<string, mixed>>  $history
+     */
+    private function rawGuzzle(array &$history): \GuzzleHttp\Client
+    {
+        $stack = \GuzzleHttp\HandlerStack::create(new \GuzzleHttp\Handler\MockHandler([new \GuzzleHttp\Psr7\Response(201), new \GuzzleHttp\Psr7\Response(503)]));
+        $stack->push(\Elgiosoft\Logger\GuzzleMiddleware::create(), 'elgiosoft_logger');
+        $stack->push(\GuzzleHttp\Middleware::history($history));
+
+        return new \GuzzleHttp\Client(['handler' => $stack, 'base_uri' => 'https://api.elgiopay.test', 'http_errors' => false]);
+    }
+
+    public function test_guzzle_middleware_propagates_the_trace_from_raw_guzzle_clients(): void
+    {
+        $this->fakeCollector();
+        $history = [];
+        $guzzle = $this->rawGuzzle($history);
+
+        ElgioLogger::trace('POST /api/v1/wallet/add-funds', function () use ($guzzle): void {
+            $guzzle->post('/api/v1/payments', ['json' => ['amount' => 100]]);
+            $guzzle->get('/api/v1/payments/1');
+        }, 'http.server');
+        $this->client()->flush();
+
+        $traceId = $this->sentSpans()[0]['trace_id'];
+        $clientSpans = collect($this->sentSpans())->where('op', 'http.client')->values();
+
+        $this->assertCount(2, $clientSpans);
+        $this->assertSame('POST api.elgiopay.test/api/v1/payments', $clientSpans[0]['name']);
+        $this->assertSame(201, $clientSpans[0]['status_code']);
+        $this->assertSame('error', $clientSpans[1]['status']);
+        $this->assertSame("00-{$traceId}-{$clientSpans[0]['span_id']}-01", $history[0]['request']->getHeaderLine('traceparent'));
+        $this->assertSame("00-{$traceId}-{$clientSpans[1]['span_id']}-01", $history[1]['request']->getHeaderLine('traceparent'));
+    }
+
+    public function test_guzzle_middleware_is_inert_without_a_trace_or_when_disabled(): void
+    {
+        $this->fakeCollector();
+        $history = [];
+        $guzzle = $this->rawGuzzle($history);
+
+        $guzzle->get('/no-trace-yet');
+        $this->assertFalse($history[0]['request']->hasHeader('traceparent'));
+
+        config(['elgiosoft-logger.key' => null]);
+        $this->app->forgetInstance(\Elgiosoft\Logger\Client::class);
+        ElgioLogger::clearResolvedInstance(\Elgiosoft\Logger\Client::class);
+        $guzzle->get('/disabled');
+        $this->assertFalse($history[1]['request']->hasHeader('traceparent'));
+    }
 }

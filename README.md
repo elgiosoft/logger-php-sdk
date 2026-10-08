@@ -173,6 +173,12 @@ ElgioLogger::trace('POST wallet-service/debit', fn () => $guzzle->post($url, [
     'json' => $payload,
 ]), 'http.client');
 
+// Raw Guzzle clients you construct yourself (or inside another SDK): push the middleware once and
+// every request carries the trace and gets an http.client span – no-op when the logger isn't active.
+$stack = \GuzzleHttp\HandlerStack::create();
+$stack->push(\Elgiosoft\Logger\GuzzleMiddleware::create(), 'elgiosoft_logger');
+$client = new \GuzzleHttp\Client(['handler' => $stack, 'base_uri' => $baseUrl]);
+
 // Or just the value, e.g. for curl_setopt or a message attribute
 $value = ElgioLogger::traceparent();            // null when the SDK is disabled
 

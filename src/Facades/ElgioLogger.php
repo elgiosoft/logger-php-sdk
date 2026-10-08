@@ -21,6 +21,7 @@ use Illuminate\Support\Facades\Facade;
  * @method static string|null traceparent()
  * @method static array<string, string> traceHeaders()
  * @method static string continueTrace(string|null $traceparent)
+ * @method static callable guzzleMiddleware()
  * @method static void flush()
  * @method static \Elgiosoft\Logger\Tracing\Tracer tracer()
  * @method static bool isEnabled()
