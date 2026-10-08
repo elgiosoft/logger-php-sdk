@@ -1,7 +1,7 @@
 # elgiosoft/logger
 
 Laravel client for **Elgiosoft Logger**, our central service for logs, error tracking and
-distributed tracing. Add it to any Laravel app (Yankap, Elgiopay, Camerstate, ...) and the app will:
+distributed tracing. Add it to any Laravel app and the app will:
 
 - ship normal `Log::...` calls to the collector, with structured context and sensitive keys redacted
 - report exceptions with full stack traces (source context for your own code) so the
@@ -39,7 +39,7 @@ The service provider and the `ElgioLogger` facade are auto-discovered.
 ```dotenv
 # ELGIOSOFT_LOGGER_ENDPOINT=https://elgiologs.com   # default; set only for a local/self-hosted collector
 ELGIOSOFT_LOGGER_KEY=elg_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx   # project key, or one account key shared by all apps
-ELGIOSOFT_LOGGER_SERVICE=yankap        # optional – defaults to APP_NAME; picks the project when using an account key
+ELGIOSOFT_LOGGER_SERVICE=checkout      # optional – defaults to APP_NAME; picks the project when using an account key
 ELGIOSOFT_LOGGER_TRANSPORT=queue                                     # queue | deferred | sync
 # optional
 ELGIOSOFT_LOGGER_ENVIRONMENT=production      # defaults to APP_ENV
@@ -88,13 +88,13 @@ trace directly to the collector, skipping the queue. It prints the trace id; sea
 ### Plain Laravel logging
 
 ```php
-Log::error('Maviance cashout failed', [
+Log::error('Payout failed', [
     'event' => 'payment.failed',          // lifted to the event's "event" field
     'transaction_id' => $transaction->id, // lifted to "transaction_id"
-    'provider' => 'maviance',             // everything else is searchable context: @provider:maviance
+    'provider' => 'mtn',                  // everything else is searchable context: @provider:mtn
     'amount' => 25000,
     'currency' => 'XAF',
-    'tags' => ['provider' => 'maviance'], // low-cardinality facets
+    'tags' => ['provider' => 'mtn'],      // low-cardinality facets
 ]);
 
 Log::error($e->getMessage(), ['exception' => $e]); // full stack trace + previous chain
@@ -114,7 +114,7 @@ ElgioLogger::setContext('wallet', ['id' => $wallet->id, 'currency' => 'XAF']);
 
 ElgioLogger::event('withdrawal.pending', 'Withdrawal pending for more than 5 minutes', [
     'transaction_id' => $tx->id,
-    'provider' => 'pawapay',
+    'provider' => 'orange',
     'amount' => 50000,
 ], 'warning');
 
@@ -139,7 +139,7 @@ Everything below is automatic once the package is installed:
 |------|-----------|-------|
 | Incoming HTTP request | `http.server` | Continues an incoming `traceparent`, otherwise starts a trace. Name `GET /api/withdrawals/{id}`. Adds `X-Trace-Id` and `X-Request-Id` response headers. 5xx marks the span `error`. |
 | DB queries | `db.query` | SQL + **parameters** (`db.params`, values of sensitive columns such as `pin = ?` redacted) + **result**: first rows of a SELECT (`db.rows`, `db.result`, sensitive columns redacted) or `db.rows_affected`. Switches: `ELGIOSOFT_LOGGER_DB_BINDINGS`, `ELGIOSOFT_LOGGER_DB_RESULTS`, `ELGIOSOFT_LOGGER_DB_RESULT_ROWS` (10), `ELGIOSOFT_LOGGER_DB_RESULT_MAX_BYTES` (8192). `tracing.db_min_duration_ms` hides fast queries. Results use a thin subclass of Laravel's connection, skipped for any driver another package already customised. |
-| Laravel HTTP client (`Http::`) | `http.client` | Injects `traceparent`, so if the callee also uses this SDK (e.g. Yankap → Elgiopay) it joins the same trace. Raw Guzzle/cURL: see *Propagating a trace by hand*. |
+| Laravel HTTP client (`Http::`) | `http.client` | Injects `traceparent`, so if the callee also uses this SDK (e.g. storefront → payments API) it joins the same trace. Raw Guzzle/cURL: see *Propagating a trace by hand*. |
 | Dispatching a job | `queue.publish` | The trace context travels inside the job payload. |
 | Running a job | `queue.job` | Continues the dispatching trace, even on another server, and flushes when the job ends. |
 | Artisan commands | `console.command` | Long-running commands (`queue:*`, `schedule:*`, `horizon`...) are ignored. |
@@ -152,8 +152,8 @@ Manual spans:
 
 ```php
 $result = ElgioLogger::trace('payout.process', function (Span $span) use ($payout) {
-    $span->setAttribute('provider', 'maviance');
-    return $this->maviance->cashout($payout); // an exception marks the span "error" and is rethrown
+    $span->setAttribute('provider', 'mtn');
+    return $this->gateway->payout($payout); // an exception marks the span "error" and is rethrown
 });
 
 $span = ElgioLogger::startSpan('pdf.render', 'function', ['pages' => 12]);
@@ -190,7 +190,7 @@ A non-Laravel service joins the trace by reading the incoming `traceparent` head
 the same `trace_id` (32 hex) and its own span ids — see `INGEST_API.md`. Searching `trace:<id>` in the
 dashboard (with "All projects" selected) then returns the logs of every service involved.
 
-Things that start a **new** trace: incoming webhooks from third parties (MTN, Orange, Pawapay, Maviance…)
+Things that start a **new** trace: incoming webhooks from third parties (payment providers, Stripe, MTN, Orange…)
 and any hop that doesn't forward the header. Log a business id such as `transaction_id` on both sides and
 search `transaction:<id>` to stitch those together.
 
