@@ -1,0 +1,62 @@
+{
+    "name": "elgiosoft/logger",
+    "description": "Laravel client for the Elgiosoft Logger - centralized logs, error tracking and distributed tracing",
+    "type": "library",
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Elgiosoft Ltd",
+            "email": "developers@elgiosoft.com"
+        }
+    ],
+    "require": {
+        "php": "^8.1",
+        "guzzlehttp/guzzle": "^7.0|^8.0",
+        "illuminate/console": "^10.0|^11.0|^12.0|^13.0",
+        "illuminate/contracts": "^10.0|^11.0|^12.0|^13.0",
+        "illuminate/database": "^10.0|^11.0|^12.0|^13.0",
+        "illuminate/http": "^10.0|^11.0|^12.0|^13.0",
+        "illuminate/log": "^10.0|^11.0|^12.0|^13.0",
+        "illuminate/queue": "^10.0|^11.0|^12.0|^13.0",
+        "illuminate/support": "^10.0|^11.0|^12.0|^13.0",
+        "monolog/monolog": "^3.0"
+    },
+    "require-dev": {
+        "orchestra/testbench": "^8.0|^9.0|^10.0|^11.0",
+        "phpunit/phpunit": "^10.0|^11.0|^12.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "Elgiosoft\\Logger\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Elgiosoft\\Logger\\Tests\\": "tests/"
+        }
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "Elgiosoft\\Logger\\LoggerServiceProvider"
+            ],
+            "aliases": {
+                "ElgioLogger": "Elgiosoft\\Logger\\Facades\\ElgioLogger"
+            }
+        }
+    },
+    "keywords": [
+        "laravel",
+        "logging",
+        "monolog",
+        "error-tracking",
+        "tracing",
+        "observability",
+        "elgiosoft"
+    ],
+    "config": {
+        "sort-packages": true
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true
+}
