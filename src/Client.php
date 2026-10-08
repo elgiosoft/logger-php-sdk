@@ -324,6 +324,32 @@ final class Client
     }
 
     /**
+     * Add attributes to a span that already finished but is still in the buffer (e.g. query results that
+     * only exist after Laravel's QueryExecuted event). Silently skipped once the span was sent.
+     *
+     * @param  array<string, mixed>  $attributes
+     */
+    public function amendSpan(string $spanId, array $attributes): void
+    {
+        try {
+            for ($i = count($this->spans) - 1; $i >= 0; $i--) {
+                if (($this->spans[$i]['span_id'] ?? null) === $spanId) {
+                    $this->spans[$i]['attributes'] = array_merge($this->spans[$i]['attributes'] ?? [], $this->clean($attributes));
+
+                    return;
+                }
+            }
+        } catch (Throwable $exception) {
+            $this->reportFailure('could not amend span: '.$exception->getMessage());
+        }
+    }
+
+    public function redactor(): Redactor
+    {
+        return $this->redactor;
+    }
+
+    /**
      * Open a span as a child of the current span.
      *
      * @param  array<string, mixed>  $attributes

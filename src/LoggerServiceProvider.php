@@ -34,6 +34,11 @@ final class LoggerServiceProvider extends ServiceProvider
     {
         $this->mergeConfigFrom(__DIR__.'/../config/elgiosoft-logger.php', 'elgiosoft-logger');
 
+        // Must happen before the first database connection is made.
+        if ($this->capturesQueryResults($this->config($this->app))) {
+            DatabaseIntegration::registerConnections();
+        }
+
         $this->app->singleton(HttpTransport::class, fn (Application $app): HttpTransport => new HttpTransport(
             $this->config($app),
             fn (string $message) => $app->make(Client::class)->reportFailure($message),
@@ -103,7 +108,9 @@ final class LoggerServiceProvider extends ServiceProvider
         (new QueueIntegration($client))->register($events);
 
         if ($tracing && $config['tracing']['db_queries']) {
-            (new DatabaseIntegration($client))->register($events);
+            $database = new DatabaseIntegration($client);
+            $database->register($events);
+            $this->app->instance(DatabaseIntegration::class, $database);
         }
 
         if ($tracing && $config['tracing']['console']) {
@@ -157,6 +164,20 @@ final class LoggerServiceProvider extends ServiceProvider
     }
 
     /**
+     * @param  array<string, mixed>  $config
+     */
+    private function capturesQueryResults(array $config): bool
+    {
+        $tracing = (array) ($config['tracing'] ?? []);
+
+        // The key/enabled state is checked at runtime by every result hand-off (config may be applied
+        // after register(), e.g. in tests); the connection subclass is a pass-through when not recording.
+        return filter_var($tracing['enabled'] ?? true, FILTER_VALIDATE_BOOLEAN)
+            && filter_var($tracing['db_queries'] ?? true, FILTER_VALIDATE_BOOLEAN)
+            && filter_var($tracing['db_results'] ?? true, FILTER_VALIDATE_BOOLEAN);
+    }
+
+    /**
      * @return array<string, mixed>
      */
     private function config(Application $app): array
@@ -170,6 +191,8 @@ final class LoggerServiceProvider extends ServiceProvider
         $config['send_default_pii'] = filter_var($config['send_default_pii'] ?? false, FILTER_VALIDATE_BOOLEAN);
         $config['tracing'] = (array) ($config['tracing'] ?? []) + ['enabled' => true, 'requests' => true, 'db_queries' => true, 'http_client' => true, 'queue' => true, 'console' => true, 'cache' => false];
         $config['tracing']['enabled'] = filter_var($config['tracing']['enabled'], FILTER_VALIDATE_BOOLEAN);
+        $config['tracing']['db_bindings'] = filter_var($config['tracing']['db_bindings'] ?? true, FILTER_VALIDATE_BOOLEAN);
+        $config['tracing']['db_results'] = filter_var($config['tracing']['db_results'] ?? true, FILTER_VALIDATE_BOOLEAN);
         $config['middleware'] = (array) ($config['middleware'] ?? []) + ['auto' => true];
         $config['transport'] = in_array($config['transport'] ?? 'queue', ['queue', 'deferred', 'sync'], true) ? $config['transport'] : 'queue';
         $config['in_app_paths'] = array_values(array_filter((array) ($config['in_app_paths'] ?? [])));

@@ -34,6 +34,16 @@ final class TracingTest extends TestCase
             return 'ok';
         });
 
+        Route::get('/wallet-queries', function () {
+            DB::statement('create table if not exists wallets (id integer primary key, user_id integer, pin text, balance integer)');
+            DB::insert('insert into wallets (user_id, pin, balance) values (?, ?, ?), (?, ?, ?)', [7, '1234', 500, 8, '9999', 10]);
+            DB::select('select * from wallets where user_id = ?', [7]);
+            DB::update('update wallets set balance = ? where balance < ?', [0, 100]);
+            DB::select('select * from wallets where user_id = ?', [404]);
+
+            return 'ok';
+        });
+
         Route::get('/queries', function () {
             DB::select('select 1 as one');
 
@@ -320,5 +330,62 @@ final class TracingTest extends TestCase
         ElgioLogger::clearResolvedInstance(\Elgiosoft\Logger\Client::class);
         $guzzle->get('/disabled');
         $this->assertFalse($history[1]['request']->hasHeader('traceparent'));
+    }
+
+    /**
+     * @return \Illuminate\Support\Collection<int, array<string, mixed>>
+     */
+    private function walletQuerySpans(): \Illuminate\Support\Collection
+    {
+        $this->get('/wallet-queries')->assertOk();
+        $this->app->terminate();
+
+        return collect($this->sentSpans())->where('op', 'db.query')->values();
+    }
+
+    public function test_query_spans_carry_parameters_and_results_with_secrets_redacted(): void
+    {
+        $this->fakeCollector();
+        $spans = $this->walletQuerySpans();
+
+        $insert = $spans->first(fn (array $span): bool => str_starts_with($span['name'], 'insert into wallets'));
+        $this->assertSame([
+            ['name' => 'user_id', 'value' => 7], ['name' => 'pin', 'value' => '[Filtered]'], ['name' => 'balance', 'value' => 500],
+            ['name' => 'user_id', 'value' => 8], ['name' => 'pin', 'value' => '[Filtered]'], ['name' => 'balance', 'value' => 10],
+        ], $insert['attributes']['db.params']);
+
+        $select = $spans->first(fn (array $span): bool => $span['name'] === 'select * from wallets where user_id = ?');
+        $this->assertSame([['name' => 'user_id', 'value' => 7]], $select['attributes']['db.params']);
+        $this->assertSame(1, $select['attributes']['db.rows']);
+        $this->assertSame(7, $select['attributes']['db.result'][0]['user_id']);
+        $this->assertSame('[Filtered]', $select['attributes']['db.result'][0]['pin']);
+        $this->assertFalse($select['attributes']['db.result_truncated']);
+
+        $update = $spans->first(fn (array $span): bool => str_starts_with($span['name'], 'update wallets'));
+        $this->assertSame(1, $update['attributes']['db.rows_affected']);
+
+        $empty = $spans->last(fn (array $span): bool => $span['name'] === 'select * from wallets where user_id = ?');
+        $this->assertSame(0, $empty['attributes']['db.rows']);
+        $this->assertArrayNotHasKey('db.result', $empty['attributes']);
+
+        $this->assertStringNotContainsString('1234', json_encode($spans->all()));
+        $this->assertStringNotContainsString('9999', json_encode($spans->all()));
+    }
+
+    protected function withoutQueryCapture($app): void
+    {
+        $app['config']->set('elgiosoft-logger.tracing.db_bindings', 'false');
+        $app['config']->set('elgiosoft-logger.tracing.db_results', 'false');
+    }
+
+    #[\Orchestra\Testbench\Attributes\DefineEnvironment('withoutQueryCapture')]
+    public function test_parameters_and_results_can_be_turned_off(): void
+    {
+        $this->fakeCollector();
+
+        $select = $this->walletQuerySpans()->first(fn (array $span): bool => str_starts_with($span['name'], 'select * from wallets'));
+
+        $this->assertArrayNotHasKey('db.params', $select['attributes']);
+        $this->assertArrayNotHasKey('db.rows', $select['attributes']);
     }
 }

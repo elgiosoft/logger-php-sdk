@@ -138,7 +138,7 @@ Everything below is automatic once the package is installed:
 | What | Span `op` | Notes |
 |------|-----------|-------|
 | Incoming HTTP request | `http.server` | Continues an incoming `traceparent`, otherwise starts a trace. Name `GET /api/withdrawals/{id}`. Adds `X-Trace-Id` and `X-Request-Id` response headers. 5xx marks the span `error`. |
-| DB queries | `db.query` | SQL only, bindings are never sent. `tracing.db_min_duration_ms` hides fast queries. |
+| DB queries | `db.query` | SQL + **parameters** (`db.params`, values of sensitive columns such as `pin = ?` redacted) + **result**: first rows of a SELECT (`db.rows`, `db.result`, sensitive columns redacted) or `db.rows_affected`. Switches: `ELGIOSOFT_LOGGER_DB_BINDINGS`, `ELGIOSOFT_LOGGER_DB_RESULTS`, `ELGIOSOFT_LOGGER_DB_RESULT_ROWS` (10), `ELGIOSOFT_LOGGER_DB_RESULT_MAX_BYTES` (8192). `tracing.db_min_duration_ms` hides fast queries. Results use a thin subclass of Laravel's connection, skipped for any driver another package already customised. |
 | Laravel HTTP client (`Http::`) | `http.client` | Injects `traceparent`, so if the callee also uses this SDK (e.g. Yankap → Elgiopay) it joins the same trace. Raw Guzzle/cURL: see *Propagating a trace by hand*. |
 | Dispatching a job | `queue.publish` | The trace context travels inside the job payload. |
 | Running a job | `queue.job` | Continues the dispatching trace, even on another server, and flushes when the job ends. |
