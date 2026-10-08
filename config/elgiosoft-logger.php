@@ -14,7 +14,8 @@ return [
 
     'enabled' => env('ELGIOSOFT_LOGGER_ENABLED', true),
 
-    'endpoint' => env('ELGIOSOFT_LOGGER_ENDPOINT', 'http://localhost:8000'),
+    // The hosted collector. Override only for a self-hosted or local collector (locally: http://elgiologs.test).
+    'endpoint' => env('ELGIOSOFT_LOGGER_ENDPOINT', 'https://elgiologs.com'),
 
     'key' => env('ELGIOSOFT_LOGGER_KEY'),
 

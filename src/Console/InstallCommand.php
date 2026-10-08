@@ -22,7 +22,7 @@ final class InstallCommand extends Command
         $this->newLine();
         $this->components->info('1. Add to your .env');
         $this->line(<<<'ENV'
-    ELGIOSOFT_LOGGER_ENDPOINT=https://logger.elgiosoft.com
+    # ELGIOSOFT_LOGGER_ENDPOINT=https://elgiologs.com   (default – only set it for a local/self-hosted collector)
     ELGIOSOFT_LOGGER_KEY=elg_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
     ELGIOSOFT_LOGGER_TRANSPORT=queue
 ENV);

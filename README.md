@@ -37,7 +37,7 @@ The service provider and the `ElgioLogger` facade are auto-discovered.
 `.env`:
 
 ```dotenv
-ELGIOSOFT_LOGGER_ENDPOINT=https://logger.elgiosoft.com
+# ELGIOSOFT_LOGGER_ENDPOINT=https://elgiologs.com   # default; set only for a local/self-hosted collector
 ELGIOSOFT_LOGGER_KEY=elg_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx   # project key, or one account key shared by all apps
 ELGIOSOFT_LOGGER_SERVICE=yankap        # optional – defaults to APP_NAME; picks the project when using an account key
 ELGIOSOFT_LOGGER_TRANSPORT=queue                                     # queue | deferred | sync

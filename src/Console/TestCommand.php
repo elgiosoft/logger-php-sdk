@@ -31,7 +31,7 @@ final class TestCommand extends Command
         $this->components->twoColumnDetail('Transport', (string) ($config['transport'] ?? '–'));
 
         if (! $client->isEnabled()) {
-            $this->components->error('The SDK is disabled: set ELGIOSOFT_LOGGER_KEY and ELGIOSOFT_LOGGER_ENDPOINT (and ELGIOSOFT_LOGGER_ENABLED=true).');
+            $this->components->error('The SDK is disabled: set ELGIOSOFT_LOGGER_KEY (and ELGIOSOFT_LOGGER_ENABLED=true). The endpoint defaults to https://elgiologs.com.');
 
             return self::FAILURE;
         }
