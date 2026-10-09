@@ -7,6 +7,7 @@ namespace Elgiosoft\Logger\Tests\Feature;
 use Elgiosoft\Logger\Facades\ElgioLogger;
 use Elgiosoft\Logger\Tests\Fixtures\ProcessPayout;
 use Elgiosoft\Logger\Tests\TestCase;
+use Illuminate\Http\Client\Factory;
 use Illuminate\Http\Client\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
@@ -125,6 +126,10 @@ final class TracingTest extends TestCase
 
     public function test_outgoing_http_calls_carry_traceparent_and_create_client_spans(): void
     {
+        if (! method_exists(Factory::class, 'globalMiddleware')) {
+            $this->markTestSkipped('The HTTP client has no global middleware before Laravel 10, so outgoing calls are not traced.');
+        }
+
         $this->fakeCollector();
 
         $response = $this->get('/calls-provider');
@@ -228,7 +233,7 @@ final class TracingTest extends TestCase
         $this->assertSame('error', $this->sentSpans()[0]['status']);
     }
 
-    public function test_unsampled_traces_send_logs_but_no_spans(): void
+    public function test_unsampled_traces_send_logs_and_only_the_request_summary(): void
     {
         $this->fakeCollector();
         $traceId = '4bf92f3577b34da6a3ce929d0e0e4736';
@@ -236,7 +241,10 @@ final class TracingTest extends TestCase
         $this->get('/orders/1', ['traceparent' => "00-{$traceId}-00f067aa0ba902b7-00"]);
         $this->app->terminate();
 
-        $this->assertSame([], $this->sentSpans());
+        $spans = $this->sentSpans();
+        $this->assertCount(1, $spans);
+        $this->assertSame('http.server', $spans[0]['op']);
+        $this->assertFalse($spans[0]['attributes']['sampled']);
         $this->assertSame($traceId, $this->sentLogs()[0]['trace_id']);
     }
 
@@ -387,5 +395,78 @@ final class TracingTest extends TestCase
 
         $this->assertArrayNotHasKey('db.params', $select['attributes']);
         $this->assertArrayNotHasKey('db.rows', $select['attributes']);
+    }
+
+    protected function unsampled($app): void
+    {
+        $app['config']->set('elgiosoft-logger.tracing.sample_rate', 0.0);
+    }
+
+    #[\Orchestra\Testbench\Attributes\DefineEnvironment('unsampled')]
+    public function test_unsampled_requests_still_send_their_summary_without_children(): void
+    {
+        $this->fakeCollector();
+
+        $this->get('/queries', ['User-Agent' => 'Scanner/1.0'])->assertOk();
+        $this->app->terminate();
+        $this->get('/wp-login.php')->assertNotFound();
+        $this->app->terminate();
+
+        $spans = collect($this->sentSpans());
+
+        $this->assertSame(['http.server', 'http.server'], $spans->pluck('op')->all(), 'only the request rows, no query spans');
+        $this->assertSame([false, false], $spans->pluck('attributes.sampled')->all());
+        $this->assertSame('/queries', $spans[0]['attributes']['http.path']);
+        $this->assertSame('Scanner/1.0', $spans[0]['attributes']['http.user_agent']);
+
+        $missing = $spans[1];
+        $this->assertSame('GET /wp-login.php', $missing['name']);
+        $this->assertSame('/wp-login.php', $missing['attributes']['http.path']);
+        $this->assertSame(404, $missing['status_code']);
+    }
+
+    protected function unsampledWithoutSummaries($app): void
+    {
+        $app['config']->set('elgiosoft-logger.tracing.sample_rate', 0.0);
+        $app['config']->set('elgiosoft-logger.tracing.all_requests', false);
+    }
+
+    #[\Orchestra\Testbench\Attributes\DefineEnvironment('unsampledWithoutSummaries')]
+    public function test_request_summaries_can_be_turned_off(): void
+    {
+        $this->fakeCollector();
+
+        $this->get('/queries')->assertOk();
+        $this->app->terminate();
+
+        $this->assertSame([], $this->sentSpans());
+    }
+
+    protected function tracingOff($app): void
+    {
+        $app['config']->set('elgiosoft-logger.tracing.enabled', false);
+    }
+
+    #[\Orchestra\Testbench\Attributes\DefineEnvironment('tracingOff')]
+    public function test_no_request_summaries_when_tracing_is_off(): void
+    {
+        $this->fakeCollector();
+
+        $this->get('/queries')->assertOk();
+        $this->app->terminate();
+
+        $this->assertSame([], $this->sentSpans());
+    }
+
+    public function test_sampled_requests_are_not_marked_unsampled(): void
+    {
+        $this->fakeCollector();
+
+        $this->get('/orders/5')->assertOk();
+        $this->app->terminate();
+
+        $root = collect($this->sentSpans())->firstWhere('op', 'http.server');
+        $this->assertArrayNotHasKey('sampled', $root['attributes']);
+        $this->assertSame('/orders/5', $root['attributes']['http.path']);
     }
 }

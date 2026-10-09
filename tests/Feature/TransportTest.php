@@ -16,6 +16,19 @@ use Illuminate\Support\Facades\Log;
 
 final class TransportTest extends TestCase
 {
+    /**
+     * Drop what a client still buffers: its logger flushes it whenever PHP destroys it, which would
+     * otherwise land in whichever test runs then.
+     */
+    protected function tearDown(): void
+    {
+        if ($this->app?->resolved(Client::class)) {
+            $this->app->make(Client::class)->drainEnvelopes();
+        }
+
+        parent::tearDown();
+    }
+
     private function useTransport(string $transport, array $extra = []): void
     {
         config(['elgiosoft-logger.transport' => $transport] + $extra);

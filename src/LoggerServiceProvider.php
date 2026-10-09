@@ -15,6 +15,7 @@ use Elgiosoft\Logger\Integrations\QueueIntegration;
 use Elgiosoft\Logger\Monolog\CreateElgiosoftLogger;
 use Elgiosoft\Logger\Serializers\ExceptionSerializer;
 use Elgiosoft\Logger\Support\Normalizer;
+use Elgiosoft\Logger\Support\BodyCapture;
 use Elgiosoft\Logger\Support\Redactor;
 use Elgiosoft\Logger\Transport\HttpTransport;
 use Elgiosoft\Logger\Transport\QueueTransport;
@@ -65,6 +66,12 @@ final class LoggerServiceProvider extends ServiceProvider
                 $this->userResolver($app, (bool) $config['send_default_pii']),
                 $this->failureReporter($app, $config['fallback_channel'] ?? null),
             );
+        });
+
+        $this->app->singleton(BodyCapture::class, function (Application $app): BodyCapture {
+            $config = $this->config($app);
+
+            return new BodyCapture(new Redactor((array) $config['redact']), $config['capture']['max_body_bytes']);
         });
 
         $this->app->alias(Client::class, 'elgiosoft-logger');
@@ -122,7 +129,7 @@ final class LoggerServiceProvider extends ServiceProvider
         }
 
         $this->callAfterResolving(HttpFactory::class, function (HttpFactory $factory) use ($client): void {
-            (new HttpClientIntegration($client))->register($factory);
+            (new HttpClientIntegration($client, $this->app->make(BodyCapture::class)))->register($factory);
         });
 
         $this->app->terminating(function () use ($client): void {
@@ -193,6 +200,14 @@ final class LoggerServiceProvider extends ServiceProvider
         $config['tracing']['enabled'] = filter_var($config['tracing']['enabled'], FILTER_VALIDATE_BOOLEAN);
         $config['tracing']['db_bindings'] = filter_var($config['tracing']['db_bindings'] ?? true, FILTER_VALIDATE_BOOLEAN);
         $config['tracing']['db_results'] = filter_var($config['tracing']['db_results'] ?? true, FILTER_VALIDATE_BOOLEAN);
+        $config['tracing']['all_requests'] = filter_var($config['tracing']['all_requests'] ?? true, FILTER_VALIDATE_BOOLEAN);
+        $capture = (array) ($config['capture'] ?? []);
+        $paths = $capture['request_paths'] ?? [];
+        $config['capture'] = [
+            'request_paths' => array_values(array_filter(array_map('trim', is_string($paths) ? explode(',', $paths) : (array) $paths))),
+            'http_client' => filter_var($capture['http_client'] ?? false, FILTER_VALIDATE_BOOLEAN),
+            'max_body_bytes' => max(256, (int) ($capture['max_body_bytes'] ?? 16384)),
+        ];
         $config['middleware'] = (array) ($config['middleware'] ?? []) + ['auto' => true];
         $config['transport'] = in_array($config['transport'] ?? 'queue', ['queue', 'deferred', 'sync'], true) ? $config['transport'] : 'queue';
         $config['in_app_paths'] = array_values(array_filter((array) ($config['in_app_paths'] ?? [])));

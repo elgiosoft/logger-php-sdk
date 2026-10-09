@@ -6,6 +6,7 @@ namespace Elgiosoft\Logger\Http\Middleware;
 
 use Closure;
 use Elgiosoft\Logger\Client;
+use Elgiosoft\Logger\Support\BodyCapture;
 use Elgiosoft\Logger\Support\Ids;
 use Illuminate\Http\Request;
 use Symfony\Component\HttpFoundation\Response;
@@ -17,7 +18,10 @@ use Throwable;
  */
 final class TraceRequests
 {
-    public function __construct(private readonly Client $client) {}
+    public function __construct(
+        private readonly Client $client,
+        private readonly BodyCapture $capture,
+    ) {}
 
     public function handle(Request $request, Closure $next): mixed
     {
@@ -41,26 +45,42 @@ final class TraceRequests
             $span = $tracer->startSpan(
                 $request->getMethod().' /'.ltrim($request->path(), '/'),
                 'http.server',
-                [
+                array_filter([
                     'http.method' => $request->getMethod(),
                     'http.url' => $request->url(),
+                    'http.path' => '/'.ltrim($request->path(), '/'),
                     'http.request_id' => $requestId,
-                ],
+                    'http.user_agent' => mb_substr((string) $request->userAgent(), 0, 255),
+                ], static fn (string $value): bool => $value !== ''),
                 'server',
             );
+        }
+
+        $captured = $span !== null && $this->captures($request, (array) ($config['capture']['request_paths'] ?? []));
+
+        if ($captured) {
+            $this->captureRequest($span, $request);
         }
 
         try {
             $response = $next($request);
         } catch (Throwable $exception) {
-            $span?->setStatus('error');
-            $span?->finish();
+            if ($span !== null) {
+                $span->setStatus('error');
+                $span->finish();
+                $this->keepSummary($span);
+            }
 
             throw $exception;
         }
 
         if ($span !== null) {
+            if ($captured) {
+                $this->captureResponse($span, $response);
+            }
+
             $this->finishSpan($span, $request, $response);
+            $this->keepSummary($span);
         }
 
         if ($response instanceof Response) {
@@ -96,6 +116,67 @@ final class TraceRequests
         }
 
         $span->finish();
+    }
+
+    /**
+     * @param  list<string>  $patterns
+     */
+    private function captures(Request $request, array $patterns): bool
+    {
+        return $patterns !== [] && $request->is(...$patterns);
+    }
+
+    private function captureRequest(\Elgiosoft\Logger\Tracing\Span $span, Request $request): void
+    {
+        try {
+            $span->setAttribute('http.request.headers', $this->capture->headers($request->headers->all()));
+
+            if ($request->query() !== []) {
+                $span->setAttribute('http.request.query', $request->query());
+            }
+
+            $body = $this->capture->fromString($request->getContent(), $request->headers->get('Content-Type'));
+
+            if ($body !== null) {
+                $span->setAttribute('http.request.body', $body);
+            }
+        } catch (Throwable $exception) {
+            $this->client->reportFailure('request capture failed: '.$exception->getMessage());
+        }
+    }
+
+    private function captureResponse(\Elgiosoft\Logger\Tracing\Span $span, mixed $response): void
+    {
+        try {
+            if (! $response instanceof Response) {
+                return;
+            }
+
+            $body = $this->capture->fromString($response->getContent(), $response->headers->get('Content-Type'));
+
+            if ($body !== null) {
+                $span->setAttribute('http.response.body', $body);
+            }
+        } catch (Throwable $exception) {
+            $this->client->reportFailure('response capture failed: '.$exception->getMessage());
+        }
+    }
+
+    /**
+     * An unsampled request still sends its own span (no children), so every request is listed.
+     */
+    private function keepSummary(\Elgiosoft\Logger\Tracing\Span $span): void
+    {
+        $tracer = $this->client->tracer();
+
+        $tracing = (array) ($this->client->config()['tracing'] ?? []);
+
+        if ($tracer->isSampled() || ! (bool) ($tracing['enabled'] ?? true) || ! (bool) ($tracing['all_requests'] ?? true)) {
+            return;
+        }
+
+        $span->setAttribute('sampled', false);
+        $tracer->keepUnsampled($span);
     }
 
     private function requestId(Request $request): string

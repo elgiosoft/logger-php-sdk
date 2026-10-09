@@ -165,6 +165,18 @@ final class Tracer
         ($this->onFinish)($span);
     }
 
+    /**
+     * Record a finished span of an unsampled trace anyway (a request's summary row).
+     */
+    public function keepUnsampled(Span $span): void
+    {
+        if ($this->sampled || $span->traceId !== $this->traceId) {
+            return;
+        }
+
+        ($this->onFinish)($span);
+    }
+
     public function markError(): void
     {
         $this->currentSpan()?->setStatus('error');

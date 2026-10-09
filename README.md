@@ -10,7 +10,7 @@ distributed tracing. Add it to any Laravel app and the app will:
   trace to other Elgiosoft services with the W3C `traceparent` header
 - keep working when the collector is down. The SDK never throws into your app and never blocks a request.
 
-Supports PHP 8.1+ and Laravel 10, 11, 12 and 13 (Monolog 3).
+Supports PHP 8.1+ and Laravel 9, 10, 11, 12 and 13 (Monolog 2 or 3). On Laravel 9, outgoing HTTP calls are not traced (the HTTP client has no global middleware before Laravel 10); everything else works.
 
 ---
 
@@ -59,7 +59,7 @@ everywhere (local, CI, ...).
     'stack' => [
         'driver' => 'stack',
         'channels' => explode(',', env('LOG_STACK', 'single,elgiosoft')), // Laravel 11+
-        // 'channels' => ['single', 'elgiosoft'],                       // Laravel 10
+        // 'channels' => ['single', 'elgiosoft'],                       // Laravel 9 and 10
         'ignore_exceptions' => false,
     ],
 
@@ -196,6 +196,11 @@ search `transaction:<id>` to stitch those together.
 
 Sampling: `ELGIOSOFT_LOGGER_SAMPLE_RATE=0.2` records spans for 20% of new traces. Logs are
 always sent and always carry the trace id. An upstream decision received in `traceparent` is respected.
+
+Every request is still listed on the Requests page: an unsampled request sends its own summary
+(method, path, route, status, duration, user agent) marked `sampled: false`, without its child spans.
+Set `ELGIOSOFT_LOGGER_ALL_REQUESTS=false` to send nothing for unsampled requests. Paths in
+`tracing.ignore_paths` (`up`, `health`, …) are never recorded.
 
 The `TraceRequests` middleware is prepended to the global middleware stack automatically. To
 place it yourself, set `middleware.auto` to `false` and add

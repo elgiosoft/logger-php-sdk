@@ -7,6 +7,7 @@ namespace Elgiosoft\Logger\Monolog;
 use Elgiosoft\Logger\Client;
 use Illuminate\Contracts\Foundation\Application;
 use Monolog\Logger;
+use Monolog\LogRecord;
 
 /**
  * Factory for the "elgiosoft" log driver:
@@ -23,9 +24,13 @@ final class CreateElgiosoftLogger
         $client = $app->make(Client::class);
         $level = $config['level'] ?? ($client->config()['level'] ?? 'debug');
 
-        return new Logger(
-            $config['name'] ?? $app->environment(),
-            [new ElgiosoftHandler($client, Logger::toMonologLevel($level), (bool) ($config['bubble'] ?? true))],
-        );
+        $bubble = (bool) ($config['bubble'] ?? true);
+
+        // Monolog 3 (Laravel 10+) passes LogRecord objects; Monolog 2 (Laravel 9) passes arrays.
+        $handler = class_exists(LogRecord::class)
+            ? new ElgiosoftHandler($client, Logger::toMonologLevel($level), $bubble)
+            : new LegacyElgiosoftHandler($client, Logger::toMonologLevel($level), $bubble);
+
+        return new Logger($config['name'] ?? $app->environment(), [$handler]);
     }
 }

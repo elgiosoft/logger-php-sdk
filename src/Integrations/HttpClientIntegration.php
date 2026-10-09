@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Elgiosoft\Logger\Integrations;
 
 use Elgiosoft\Logger\Client;
+use Elgiosoft\Logger\Support\BodyCapture;
 use Elgiosoft\Logger\Tracing\Span;
 use GuzzleHttp\Promise\Create;
 use GuzzleHttp\Promise\PromiseInterface;
@@ -15,11 +16,15 @@ use Throwable;
 
 /**
  * Injects the W3C traceparent header into outgoing Laravel HTTP client calls and records
- * an "http.client" span for each of them.
+ * an "http.client" span for each of them. With capture.http_client on, the span also carries the
+ * request and response bodies and is kept even when the trace is not sampled.
  */
 final class HttpClientIntegration
 {
-    public function __construct(private readonly Client $client) {}
+    public function __construct(
+        private readonly Client $client,
+        private readonly BodyCapture $capture,
+    ) {}
 
     public function register(Factory $factory): void
     {
@@ -40,6 +45,8 @@ final class HttpClientIntegration
             }
 
             $span = null;
+            $config = $this->client->config();
+            $captures = (bool) ($config['capture']['http_client'] ?? false) && (bool) ($config['tracing']['enabled'] ?? true);
 
             try {
                 if ((bool) ($this->client->config()['tracing']['http_client'] ?? true) && $tracer->currentSpan() !== null) {
@@ -58,6 +65,14 @@ final class HttpClientIntegration
                     );
                 }
 
+                if ($span !== null && $captures) {
+                    $span->setAttribute('http.request.headers', $this->capture->headers($request->getHeaders()));
+
+                    if (($body = $this->capture->fromMessage($request)) !== null) {
+                        $span->setAttribute('http.request.body', $body);
+                    }
+                }
+
                 $traceparent = $tracer->traceparent($span);
 
                 if ($traceparent !== null) {
@@ -68,17 +83,28 @@ final class HttpClientIntegration
             }
 
             return $handler($request, $options)->then(
-                function (ResponseInterface $response) use ($span): ResponseInterface {
-                    $this->finish($span, $response->getStatusCode());
+                function (ResponseInterface $response) use ($span, $captures, $options): ResponseInterface {
+                    // Streamed downloads and sinks are left alone: reading them would consume the body.
+                    if ($span !== null && $captures && empty($options['stream']) && empty($options['sink'])) {
+                        try {
+                            if (($body = $this->capture->fromMessage($response)) !== null) {
+                                $span->setAttribute('http.response.body', $body);
+                            }
+                        } catch (Throwable $exception) {
+                            $this->client->reportFailure('http client capture failed: '.$exception->getMessage());
+                        }
+                    }
+
+                    $this->finish($span, $response->getStatusCode(), $captures);
 
                     return $response;
                 },
-                function (mixed $reason) use ($span): PromiseInterface {
+                function (mixed $reason) use ($span, $captures): PromiseInterface {
                     if ($span !== null) {
                         $span->setAttribute('error.message', $reason instanceof Throwable ? $reason->getMessage() : 'request failed');
                     }
 
-                    $this->finish($span, null);
+                    $this->finish($span, null, $captures);
 
                     return Create::rejectionFor($reason);
                 },
@@ -86,7 +112,7 @@ final class HttpClientIntegration
         };
     }
 
-    private function finish(?Span $span, ?int $status): void
+    private function finish(?Span $span, ?int $status, bool $keepUnsampled = false): void
     {
         if ($span === null) {
             return;
@@ -99,5 +125,14 @@ final class HttpClientIntegration
 
         $span->setStatus($status !== null && $status < 500 ? 'ok' : 'error');
         $span->finish();
+
+        // Captured calls are kept even when the trace is not sampled: they are the record of what a
+        // provider was sent and answered.
+        $tracer = $this->client->tracer();
+
+        if ($keepUnsampled && ! $tracer->isSampled()) {
+            $span->setAttribute('sampled', false);
+            $tracer->keepUnsampled($span);
+        }
     }
 }

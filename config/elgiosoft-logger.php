@@ -74,6 +74,11 @@ return [
         'sample_rate' => (float) env('ELGIOSOFT_LOGGER_SAMPLE_RATE', 1.0),
 
         'requests' => true,
+
+        // Send every request's summary (method, path, status, duration) even when its trace is not
+        // sampled, so the Requests page lists all of them. Its child spans still follow sample_rate.
+        'all_requests' => env('ELGIOSOFT_LOGGER_ALL_REQUESTS', true),
+
         'db_queries' => true,
         'db_min_duration_ms' => (float) env('ELGIOSOFT_LOGGER_DB_MIN_DURATION_MS', 0),
 
@@ -122,6 +127,30 @@ return [
             'list',
             'help',
         ],
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Payload capture (off by default)
+    |--------------------------------------------------------------------------
+    |
+    | Keeps HTTP bodies on the request / http.client spans, e.g. to see what a
+    | provider sent to a webhook or answered to a payment call. Values of the
+    | "redact" keys are masked, credentials and cookies are dropped, binary
+    | content is only described and bodies are cut at max_body_bytes.
+    |
+    */
+
+    'capture' => [
+        // Incoming paths whose request headers, query, body and response body are kept,
+        // comma-separated route patterns: "webhooks/*,api/callbacks/*".
+        'request_paths' => env('ELGIOSOFT_LOGGER_CAPTURE_PATHS', ''),
+
+        // Request and response bodies of outgoing HTTP calls (Laravel Http client and
+        // GuzzleMiddleware). These calls are then kept even when the trace is not sampled.
+        'http_client' => env('ELGIOSOFT_LOGGER_CAPTURE_HTTP_CLIENT', false),
+
+        'max_body_bytes' => (int) env('ELGIOSOFT_LOGGER_CAPTURE_MAX_BYTES', 16384),
     ],
 
     // Push the TraceRequests middleware to the front of the global middleware stack.
