@@ -6,8 +6,10 @@ namespace Elgiosoft\Logger\Integrations;
 
 use Elgiosoft\Logger\Client;
 use Elgiosoft\Logger\Jobs\SendBatch;
+use Elgiosoft\Logger\Support\Ids;
 use Elgiosoft\Logger\Support\Time;
 use Elgiosoft\Logger\Tracing\Span;
+use Elgiosoft\Logger\Tracing\TraceParent;
 use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Contracts\Queue\Job;
 use Illuminate\Queue\Events\JobExceptionOccurred;
@@ -26,6 +28,10 @@ use Throwable;
  * - In the worker: the trace is continued, a consumer span is opened, and on completion the
  *   span is finished and the buffer flushed. State is saved/restored so synchronous jobs
  *   running inside a request do not clobber the request's trace.
+ * - A job with a public "traceId" property (a trace id or a full traceparent) runs in that trace
+ *   instead of the dispatcher's, e.g. to keep a payment's trace across jobs dispatched later.
+ * - When a job throws, the worker reports the exception only after the job's trace is restored,
+ *   so the trace is remembered on the exception and the error log still links to it.
  */
 final class QueueIntegration
 {
@@ -58,7 +64,17 @@ final class QueueIntegration
         try {
             $tracer = $this->client->tracer();
 
-            if (! $this->client->isRecording() || ! $tracer->hasActiveTrace() || $this->isOwnJob($payload)) {
+            if (! $this->client->isRecording() || $this->isOwnJob($payload)) {
+                return [];
+            }
+
+            $requested = $this->requestedTrace($payload);
+
+            if ($requested !== null && $requested['trace_id'] !== $tracer->traceId()) {
+                return [self::PAYLOAD_KEY => $requested];
+            }
+
+            if (! $tracer->hasActiveTrace()) {
                 return [];
             }
 
@@ -108,7 +124,7 @@ final class QueueIntegration
             $context = $payload[self::PAYLOAD_KEY] ?? null;
 
             if (is_array($context) && is_string($context['trace_id'] ?? null)) {
-                $tracer->continueTrace($context['trace_id'], $context['span_id'] ?? null, (bool) ($context['sampled'] ?? true));
+                $tracer->continueTrace($context['trace_id'], $context['span_id'] ?? null, isset($context['sampled']) ? (bool) $context['sampled'] : null);
             } else {
                 $tracer->startTrace();
             }
@@ -149,6 +165,10 @@ final class QueueIntegration
         unset($this->running[$key]);
 
         try {
+            if ($exception !== null) {
+                $this->client->rememberExceptionOrigin($exception, $state['span']?->spanId);
+            }
+
             if ($state['span'] !== null) {
                 $state['span']->setStatus($exception === null ? 'ok' : 'error');
                 $state['span']->finish();
@@ -159,6 +179,33 @@ final class QueueIntegration
             $this->client->tracer()->restoreState();
             $this->client->popScope();
         }
+    }
+
+    /**
+     * The trace a job asks to run in through a public "traceId" property: a 32-hex trace id
+     * (sampling decided by the worker) or a full traceparent.
+     *
+     * @param  array<string, mixed>  $payload
+     * @return array{trace_id: string, span_id: ?string, sampled?: bool}|null
+     */
+    private function requestedTrace(array $payload): ?array
+    {
+        $command = $payload['data']['command'] ?? null;
+        $value = is_object($command) ? (get_object_vars($command)['traceId'] ?? null) : null;
+
+        if (! is_string($value) || $value === '') {
+            return null;
+        }
+
+        $parent = TraceParent::parse($value);
+
+        if ($parent !== null) {
+            return ['trace_id' => $parent['trace_id'], 'span_id' => $parent['parent_span_id'], 'sampled' => $parent['sampled']];
+        }
+
+        $traceId = strtolower($value);
+
+        return Ids::isTraceId($traceId) ? ['trace_id' => $traceId, 'span_id' => null] : null;
     }
 
     /**

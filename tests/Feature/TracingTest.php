@@ -5,14 +5,19 @@ declare(strict_types=1);
 namespace Elgiosoft\Logger\Tests\Feature;
 
 use Elgiosoft\Logger\Facades\ElgioLogger;
+use Elgiosoft\Logger\Tests\Fixtures\DeliverWebhook;
+use Elgiosoft\Logger\Tests\Fixtures\NotifyMerchant;
 use Elgiosoft\Logger\Tests\Fixtures\ProcessPayout;
 use Elgiosoft\Logger\Tests\TestCase;
+use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Http\Client\Factory;
 use Illuminate\Http\Client\Request;
+use Illuminate\Queue\WorkerOptions;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Route;
+use Illuminate\Support\Facades\Schema;
 use RuntimeException;
 
 final class TracingTest extends TestCase
@@ -53,6 +58,12 @@ final class TracingTest extends TestCase
 
         Route::get('/dispatches', function () {
             ProcessPayout::dispatch('txn_42');
+
+            return 'ok';
+        });
+
+        Route::get('/dispatches-webhook', function () {
+            DeliverWebhook::dispatch(7)->onConnection('database');
 
             return 'ok';
         });
@@ -191,6 +202,89 @@ final class TracingTest extends TestCase
 
         // The request's trace state was restored after the synchronous job finished.
         $this->assertSame('ok', $root['status']);
+    }
+
+    public function test_exceptions_reported_by_the_queue_worker_keep_the_job_trace(): void
+    {
+        $this->fakeCollector();
+        Schema::create('jobs', function (Blueprint $table) {
+            $table->bigIncrements('id');
+            $table->string('queue')->index();
+            $table->longText('payload');
+            $table->unsignedTinyInteger('attempts');
+            $table->unsignedInteger('reserved_at')->nullable();
+            $table->unsignedInteger('available_at');
+            $table->unsignedInteger('created_at');
+        });
+        $this->app['config']->set('queue.connections.database', [
+            'driver' => 'database',
+            'connection' => 'testing',
+            'table' => 'jobs',
+            'queue' => 'default',
+            'retry_after' => 90,
+        ]);
+
+        $response = $this->get('/dispatches-webhook');
+        $this->app->terminate();
+        $traceId = $response->headers->get('X-Trace-Id');
+
+        $this->app->make('queue.worker')->runNextJob('database', 'default', new WorkerOptions);
+        $this->client()->flush();
+
+        $job = collect($this->sentSpans())->firstWhere('op', 'queue.job');
+        $log = collect($this->sentLogs())->firstWhere('message', 'Webhook returned 502');
+
+        $this->assertNotNull($job);
+        $this->assertSame('error', $job['status']);
+        $this->assertNotNull($log);
+        $this->assertSame($traceId, $log['trace_id']);
+        $this->assertSame($job['span_id'], $log['span_id']);
+        $this->assertSame(['delivery_id' => 7], $log['context']['webhook']);
+    }
+
+    public function test_jobs_with_a_trace_id_property_run_in_that_trace(): void
+    {
+        $this->fakeCollector();
+        $requestTraceId = ElgioLogger::continueTrace(null);
+
+        NotifyMerchant::dispatch('txn_1', '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01');
+        NotifyMerchant::dispatch('txn_2', '0af7651916cd43dd8448eb211c80319c');
+        $this->client()->flush();
+
+        $logs = collect($this->sentLogs())->keyBy(fn (array $log) => $log['transaction_id']);
+        $jobs = collect($this->sentSpans())->where('op', 'queue.job')->values();
+
+        $this->assertSame('4bf92f3577b34da6a3ce929d0e0e4736', $logs['txn_1']['trace_id']);
+        $this->assertSame('00f067aa0ba902b7', $jobs->firstWhere('trace_id', '4bf92f3577b34da6a3ce929d0e0e4736')['parent_span_id']);
+        $this->assertSame('0af7651916cd43dd8448eb211c80319c', $logs['txn_2']['trace_id']);
+        $this->assertSame($requestTraceId, ElgioLogger::traceId());
+    }
+
+    public function test_jobs_with_the_current_trace_id_or_none_keep_the_dispatching_trace(): void
+    {
+        $this->fakeCollector();
+        $requestTraceId = ElgioLogger::continueTrace(null);
+
+        NotifyMerchant::dispatch('txn_1', $requestTraceId);
+        NotifyMerchant::dispatch('txn_2', 'not-a-trace');
+        NotifyMerchant::dispatch('txn_3');
+        $this->client()->flush();
+
+        foreach ($this->sentLogs() as $log) {
+            $this->assertSame($requestTraceId, $log['trace_id']);
+        }
+        $this->assertCount(3, $this->sentLogs());
+    }
+
+    public function test_jobs_with_a_trace_id_are_traced_when_dispatched_outside_a_trace(): void
+    {
+        $this->fakeCollector();
+        $this->client()->tracer()->reset();
+
+        NotifyMerchant::dispatch('txn_1', '0af7651916cd43dd8448eb211c80319c');
+        $this->client()->flush();
+
+        $this->assertSame('0af7651916cd43dd8448eb211c80319c', $this->sentLogs()[0]['trace_id']);
     }
 
     public function test_manual_spans_and_trace_helper(): void

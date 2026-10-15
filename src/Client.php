@@ -16,6 +16,7 @@ use Elgiosoft\Logger\Tracing\Span;
 use Elgiosoft\Logger\Tracing\Tracer;
 use Elgiosoft\Logger\Transport\Transport;
 use Throwable;
+use WeakMap;
 
 /**
  * Buffers log events and spans for the current unit of work and ships them to the collector.
@@ -62,6 +63,14 @@ final class Client
     private readonly Tracer $tracer;
 
     /**
+     * Where each exception was thrown, for exceptions reported after their trace ended
+     * (Laravel's queue worker reports a job's exception after the job's events have fired).
+     *
+     * @var WeakMap<Throwable, array{trace_id: string, span_id: ?string, contexts: array<string, array<array-key, mixed>>}>
+     */
+    private WeakMap $exceptionOrigins;
+
+    /**
      * @param  array<string, mixed>  $config  The "elgiosoft-logger" config array.
      * @param  (Closure(): (array<string, string>|null))|null  $userResolver
      * @param  (Closure(string): void)|null  $failureReporter
@@ -76,6 +85,7 @@ final class Client
         private ?Closure $failureReporter = null,
     ) {
         $this->scope = new Scope;
+        $this->exceptionOrigins = new WeakMap;
         $this->tracer = new Tracer(
             fn (Span $span) => $this->addSpan($span),
             (bool) ($config['tracing']['enabled'] ?? true) ? (float) ($config['tracing']['sample_rate'] ?? 1.0) : 0.0,
@@ -222,6 +232,25 @@ final class Client
     public function popScope(): void
     {
         $this->scope = array_pop($this->scopeStack) ?? new Scope;
+    }
+
+    /**
+     * Remember the active trace, span and contexts for an exception, so that reporting it later,
+     * after that trace has ended, still links the log to the trace it was thrown in.
+     */
+    public function rememberExceptionOrigin(Throwable $exception, ?string $spanId = null): void
+    {
+        $traceId = $this->tracer->traceId();
+
+        if ($traceId === null || isset($this->exceptionOrigins[$exception])) {
+            return;
+        }
+
+        $this->exceptionOrigins[$exception] = [
+            'trace_id' => $traceId,
+            'span_id' => $spanId ?? $this->tracer->currentSpanId(),
+            'contexts' => $this->scope->contexts,
+        ];
     }
 
     /**
@@ -587,6 +616,7 @@ final class Client
         $transactionId = $this->pull($context, 'transaction_id');
         $requestId = $this->pull($context, 'request_id') ?? ($this->requestContext['request_id'] ?? null);
         $fingerprint = $this->pullFingerprint($context);
+        $origin = $exception !== null ? ($this->exceptionOrigins[$exception] ?? null) : null;
         $extraTags = isset($context['tags']) && is_array($context['tags']) ? $context['tags'] : [];
         unset($context['tags']);
 
@@ -597,13 +627,13 @@ final class Client
             'message' => $this->normalizer->truncate($message, 32768),
             'event' => $event,
             'channel' => $channel,
-            'trace_id' => $this->tracer->traceId(),
-            'span_id' => $this->tracer->currentSpan()?->spanId,
+            'trace_id' => $origin['trace_id'] ?? $this->tracer->traceId(),
+            'span_id' => $origin !== null ? $origin['span_id'] : $this->tracer->currentSpan()?->spanId,
             'request_id' => $requestId,
             'transaction_id' => $transactionId,
             'user' => $this->resolveUser(),
             'http' => $this->requestContext['http'] ?? null,
-            'context' => $this->clean(array_merge($this->scope->contexts, $context)),
+            'context' => $this->clean(array_merge($origin['contexts'] ?? [], $this->scope->contexts, $context)),
             'tags' => $this->buildTags($extraTags),
             'fingerprint' => $fingerprint,
         ];
@@ -611,7 +641,7 @@ final class Client
         if ($exception !== null) {
             $log['exception'] = $this->exceptionSerializer->serialize($exception);
 
-            if (Level::isAtLeast($level, 'error')) {
+            if (Level::isAtLeast($level, 'error') && ($origin === null || $origin['trace_id'] === $this->tracer->traceId())) {
                 $this->tracer->markError();
             }
         }
