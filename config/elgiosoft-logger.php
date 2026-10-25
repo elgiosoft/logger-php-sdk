@@ -85,10 +85,11 @@ return [
         // Query parameters on db.query spans (values of sensitive columns, e.g. `pin = ?`, are redacted).
         'db_bindings' => env('ELGIOSOFT_LOGGER_DB_BINDINGS', true),
 
-        // Query results on db.query spans: first rows of a SELECT (sensitive columns redacted) or the
-        // affected-row count of an UPDATE/DELETE. Turn off where result data must not leave the app.
+        // Query results on db.query spans: the row count of a SELECT or the affected-row count of an
+        // UPDATE/DELETE. The rows themselves are only sent when db_result_rows is above 0 (sensitive
+        // columns redacted by name); they hold real data (tokens, keys, emails), so keep it at 0 in production.
         'db_results' => env('ELGIOSOFT_LOGGER_DB_RESULTS', true),
-        'db_result_rows' => (int) env('ELGIOSOFT_LOGGER_DB_RESULT_ROWS', 10),
+        'db_result_rows' => (int) env('ELGIOSOFT_LOGGER_DB_RESULT_ROWS', 0),
         'db_result_max_bytes' => (int) env('ELGIOSOFT_LOGGER_DB_RESULT_MAX_BYTES', 8192),
         'http_client' => true,
         'queue' => true,

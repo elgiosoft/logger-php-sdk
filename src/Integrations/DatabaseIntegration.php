@@ -21,8 +21,9 @@ use Throwable;
 /**
  * Records a "db.query" span for every query run inside an active trace, with
  *  - its parameters (tracing.db_bindings): values of sensitive columns are redacted by name, and
- *  - its result (tracing.db_results): first rows of a SELECT (sensitive columns redacted) or the
- *    affected-row count of an UPDATE/DELETE, attached once Laravel returns them.
+ *  - its result (tracing.db_results): the row count of a SELECT or the affected-row count of an
+ *    UPDATE/DELETE, attached once Laravel returns them. The first rows themselves (sensitive columns
+ *    redacted) only with tracing.db_result_rows above 0: off by default, results carry real data.
  */
 final class DatabaseIntegration
 {
@@ -126,7 +127,7 @@ final class DatabaseIntegration
         }
 
         $tracing = $this->client->config()['tracing'] ?? [];
-        $limit = max(0, (int) ($tracing['db_result_rows'] ?? 10));
+        $limit = max(0, (int) ($tracing['db_result_rows'] ?? 0));
         $maxBytes = max(256, (int) ($tracing['db_result_max_bytes'] ?? 8192));
         $sample = array_map(static fn (mixed $row): mixed => is_object($row) ? (array) $row : $row, array_slice($rows, 0, $limit));
 

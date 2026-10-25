@@ -445,7 +445,27 @@ final class TracingTest extends TestCase
         return collect($this->sentSpans())->where('op', 'db.query')->values();
     }
 
-    public function test_query_spans_carry_parameters_and_results_with_secrets_redacted(): void
+    public function test_query_spans_carry_parameters_and_row_counts_but_no_rows_by_default(): void
+    {
+        $this->fakeCollector();
+        $spans = $this->walletQuerySpans();
+
+        $select = $spans->first(fn (array $span): bool => $span['name'] === 'select * from wallets where user_id = ?');
+        $this->assertSame([['name' => 'user_id', 'value' => 7]], $select['attributes']['db.params']);
+        $this->assertSame(1, $select['attributes']['db.rows']);
+        $this->assertArrayNotHasKey('db.result', $select['attributes']);
+
+        $update = $spans->first(fn (array $span): bool => str_starts_with($span['name'], 'update wallets'));
+        $this->assertSame(1, $update['attributes']['db.rows_affected']);
+    }
+
+    protected function withResultRows($app): void
+    {
+        $app['config']->set('elgiosoft-logger.tracing.db_result_rows', 10);
+    }
+
+    #[\Orchestra\Testbench\Attributes\DefineEnvironment('withResultRows')]
+    public function test_query_spans_carry_results_with_secrets_redacted_when_opted_in(): void
     {
         $this->fakeCollector();
         $spans = $this->walletQuerySpans();
