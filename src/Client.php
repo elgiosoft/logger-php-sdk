@@ -66,9 +66,18 @@ final class Client
      * Where each exception was thrown, for exceptions reported after their trace ended
      * (Laravel's queue worker reports a job's exception after the job's events have fired).
      *
-     * @var WeakMap<Throwable, array{trace_id: string, span_id: ?string, contexts: array<string, array<array-key, mixed>>}>
+     * @var WeakMap<Throwable, array{trace_id: string, span_id: ?string, contexts: array<string, array<array-key, mixed>>, breadcrumbs: list<array<string, mixed>>}>
      */
     private WeakMap $exceptionOrigins;
+
+    /**
+     * Exceptions already captured, with the id of their log (null when sampled away) and where they were
+     * captured from ("handler" for the exception-handler hook, "log" for the channel / public API), so an
+     * exception reported by Laravel's handler AND logged through the "elgiosoft" channel is sent once.
+     *
+     * @var WeakMap<Throwable, array{id: ?string, source: string}>
+     */
+    private WeakMap $capturedExceptions;
 
     /**
      * @param  array<string, mixed>  $config  The "elgiosoft-logger" config array.
@@ -86,6 +95,7 @@ final class Client
     ) {
         $this->scope = new Scope;
         $this->exceptionOrigins = new WeakMap;
+        $this->capturedExceptions = new WeakMap;
         $this->tracer = new Tracer(
             fn (Span $span) => $this->addSpan($span),
             (bool) ($config['tracing']['enabled'] ?? true) ? (float) ($config['tracing']['sample_rate'] ?? 1.0) : 0.0,
@@ -250,7 +260,77 @@ final class Client
             'trace_id' => $traceId,
             'span_id' => $spanId ?? $this->tracer->currentSpanId(),
             'contexts' => $this->scope->contexts,
+            'breadcrumbs' => $this->scope->breadcrumbs,
         ];
+    }
+
+    // ---------------------------------------------------------------- breadcrumbs
+
+    /**
+     * Record a breadcrumb (recent activity attached to the next error). Data is normalized and redacted,
+     * the message scrubbed; the oldest breadcrumb is dropped once breadcrumbs.max is reached.
+     *
+     * @param  array<array-key, mixed>  $data
+     */
+    public function addBreadcrumb(string $category, string $message, string $level = 'info', array $data = []): void
+    {
+        $max = $this->maxBreadcrumbs();
+
+        if ($max === 0 || ! $this->isRecording()) {
+            return;
+        }
+
+        try {
+            $breadcrumb = [
+                'timestamp' => Time::format(Time::now()),
+                'category' => $category,
+                'message' => $this->scrub($this->normalizer->truncate($message, 1024)),
+                'level' => Level::normalize($level),
+            ];
+
+            if ($data !== []) {
+                $breadcrumb['data'] = $this->clean($data);
+            }
+
+            $this->scope->breadcrumbs[] = $breadcrumb;
+
+            if (count($this->scope->breadcrumbs) > $max) {
+                $this->scope->breadcrumbs = array_slice($this->scope->breadcrumbs, -$max);
+            }
+        } catch (Throwable $exception) {
+            $this->reportFailure('could not record breadcrumb: '.$exception->getMessage());
+        }
+    }
+
+    /**
+     * @return list<array<string, mixed>>
+     */
+    public function breadcrumbs(): array
+    {
+        return $this->scope->breadcrumbs;
+    }
+
+    /**
+     * Start a new unit of work (request, job, command) with no breadcrumbs.
+     */
+    public function clearBreadcrumbs(): void
+    {
+        $this->scope->breadcrumbs = [];
+    }
+
+    /**
+     * Whether breadcrumbs are kept for a source: logs, db_queries, http_client, cache, queue or console.
+     */
+    public function recordsBreadcrumbs(string $source): bool
+    {
+        return $this->maxBreadcrumbs() > 0
+            && $this->isRecording()
+            && (bool) ($this->config['breadcrumbs'][$source] ?? true);
+    }
+
+    private function maxBreadcrumbs(): int
+    {
+        return max(0, (int) ($this->config['breadcrumbs']['max'] ?? 30));
     }
 
     /**
@@ -278,6 +358,10 @@ final class Client
      */
     public function log(string $level, string $message, array $context = [], ?string $event = null): ?string
     {
+        if ($this->recordsBreadcrumbs('logs')) {
+            $this->addBreadcrumb('log', $message, $level, $event !== null ? ['event' => $event] : []);
+        }
+
         if (! Level::isAtLeast($level, $this->config['level'] ?? 'debug')) {
             return null;
         }
@@ -304,28 +388,32 @@ final class Client
     }
 
     /**
+     * Capture an exception reported through Laravel's exception handler (the handler already applied
+     * dontReport / shouldReport). Skipped when the same exception object was already captured; when the
+     * "elgiosoft" channel later receives the handler's log record for it, that record is merged into
+     * this event instead of creating a second one.
+     *
+     * @param  array<array-key, mixed>  $context
+     */
+    public function captureReportedException(Throwable $exception, array $context = [], string $level = 'error'): ?string
+    {
+        if (! $this->isRecording() || isset($this->capturedExceptions[$exception])) {
+            return null;
+        }
+
+        $context['exception'] = $exception;
+
+        return $this->record($level, $exception->getMessage() !== '' ? $exception->getMessage() : $exception::class, $context, null, null, null, 'handler');
+    }
+
+    /**
      * Build a log event and add it to the buffer. Returns the event id, or null when not captured.
      *
      * @param  array<array-key, mixed>  $context
      */
     public function capture(string $level, string $message, array $context = [], ?string $channel = null, ?DateTimeInterface $time = null, ?string $event = null): ?string
     {
-        if (! $this->isRecording()) {
-            return null;
-        }
-
-        try {
-            $log = $this->buildLog($level, $message, $context, $channel, $time, $event);
-        } catch (Throwable $exception) {
-            $this->reportFailure('could not build log event: '.$exception->getMessage());
-
-            return null;
-        }
-
-        $this->logs[] = $log;
-        $this->afterCapture();
-
-        return $log['id'];
+        return $this->record($level, $message, $context, $channel, $time, $event, 'log');
     }
 
     public function addSpan(Span $span): void
@@ -548,6 +636,7 @@ final class Client
     public function resetRequestState(): void
     {
         $this->requestContext = [];
+        $this->scope->breadcrumbs = [];
         $this->tracer->reset();
     }
 
@@ -588,6 +677,122 @@ final class Client
         ], static fn (mixed $value): bool => $value !== null && $value !== '');
     }
 
+    /**
+     * @param  array<array-key, mixed>  $context
+     */
+    private function record(string $level, string $message, array $context, ?string $channel, ?DateTimeInterface $time, ?string $event, string $source): ?string
+    {
+        if (! $this->isRecording()) {
+            return null;
+        }
+
+        $exception = isset($context['exception']) && $context['exception'] instanceof Throwable ? $context['exception'] : null;
+        $previous = $exception !== null ? ($this->capturedExceptions[$exception] ?? null) : null;
+
+        if ($previous !== null && $previous['source'] === 'handler' && $source === 'log') {
+            return $this->mergeIntoCaptured($previous['id'], $level, $context, $channel);
+        }
+
+        if (! $this->passesSampling($level)) {
+            if ($exception !== null) {
+                $this->capturedExceptions[$exception] = ['id' => null, 'source' => $source];
+            }
+
+            return null;
+        }
+
+        try {
+            $log = $this->buildLog($level, $message, $context, $channel, $time, $event);
+        } catch (Throwable $failure) {
+            $this->reportFailure('could not build log event: '.$failure->getMessage());
+
+            return null;
+        }
+
+        if ($exception !== null) {
+            $this->capturedExceptions[$exception] = ['id' => $log['id'], 'source' => $source];
+        }
+
+        $this->logs[] = $log;
+        $this->afterCapture();
+
+        return $log['id'];
+    }
+
+    /**
+     * Fold a second capture of an exception (the handler's log record arriving through the channel) into
+     * the event the exception-handler hook already buffered: its level, channel and context win.
+     *
+     * @param  array<array-key, mixed>  $context
+     */
+    private function mergeIntoCaptured(?string $id, string $level, array $context, ?string $channel): ?string
+    {
+        if ($id === null) {
+            return null;
+        }
+
+        try {
+            for ($i = count($this->logs) - 1; $i >= 0; $i--) {
+                if ($this->logs[$i]['id'] !== $id) {
+                    continue;
+                }
+
+                unset($context['exception']);
+                $log = $this->logs[$i];
+                $log['level'] = Level::normalize($level);
+
+                foreach (['event', 'transaction_id'] as $key) {
+                    $value = $this->pull($context, $key);
+
+                    if ($value !== null) {
+                        $log[$key] = $value;
+                    }
+                }
+
+                $log['fingerprint'] = $this->pullFingerprint($context) ?? ($log['fingerprint'] ?? null);
+                $extraTags = isset($context['tags']) && is_array($context['tags']) ? $context['tags'] : [];
+                unset($context['tags']);
+                $log['tags'] = array_merge($log['tags'] ?? [], $this->buildTags($extraTags));
+                $log['channel'] = $channel ?? ($log['channel'] ?? null);
+                $log['context'] = array_merge($log['context'] ?? [], $this->clean($context));
+
+                $this->logs[$i] = array_filter($log, static fn (mixed $value): bool => $value !== null && $value !== [] && $value !== '');
+
+                break;
+            }
+        } catch (Throwable $exception) {
+            $this->reportFailure('could not merge log event: '.$exception->getMessage());
+        }
+
+        return $id;
+    }
+
+    /**
+     * logs_sample_rate applies below "error", errors_sample_rate from "error" up; each is independent of
+     * tracing.sample_rate.
+     */
+    private function passesSampling(string $level): bool
+    {
+        $rate = Level::isAtLeast($level, 'error')
+            ? (float) ($this->config['errors_sample_rate'] ?? 1.0)
+            : (float) ($this->config['logs_sample_rate'] ?? 1.0);
+
+        if ($rate >= 1.0) {
+            return true;
+        }
+
+        if ($rate <= 0.0) {
+            return false;
+        }
+
+        return mt_rand() / mt_getrandmax() < $rate;
+    }
+
+    private function scrub(string $text): string
+    {
+        return (bool) ($this->config['scrub_messages'] ?? true) ? $this->redactor->scrubText($text) : $text;
+    }
+
     private function afterCapture(): void
     {
         $transport = $this->config['transport'] ?? 'queue';
@@ -619,12 +824,17 @@ final class Client
         $origin = $exception !== null ? ($this->exceptionOrigins[$exception] ?? null) : null;
         $extraTags = isset($context['tags']) && is_array($context['tags']) ? $context['tags'] : [];
         unset($context['tags']);
+        $breadcrumbs = $origin['breadcrumbs'] ?? $this->scope->breadcrumbs;
+
+        if ($breadcrumbs !== [] && Level::isAtLeast($level, 'error') && ! array_key_exists('breadcrumbs', $context)) {
+            $context['breadcrumbs'] = $breadcrumbs;
+        }
 
         $log = [
             'id' => Ids::uuid(),
             'timestamp' => Time::format($time ?? Time::now()),
             'level' => $level,
-            'message' => $this->normalizer->truncate($message, 32768),
+            'message' => $this->scrub($this->normalizer->truncate($message, 32768)),
             'event' => $event,
             'channel' => $channel,
             'trace_id' => $origin['trace_id'] ?? $this->tracer->traceId(),
@@ -640,6 +850,12 @@ final class Client
 
         if ($exception !== null) {
             $log['exception'] = $this->exceptionSerializer->serialize($exception);
+
+            foreach ($log['exception']['values'] as $index => $value) {
+                if (is_string($value['value'] ?? null)) {
+                    $log['exception']['values'][$index]['value'] = $this->scrub($value['value']);
+                }
+            }
 
             if (Level::isAtLeast($level, 'error') && ($origin === null || $origin['trace_id'] === $this->tracer->traceId())) {
                 $this->tracer->markError();

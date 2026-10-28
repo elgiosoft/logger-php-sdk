@@ -23,9 +23,23 @@ final class ElgiosoftHandler extends AbstractProcessingHandler
         parent::__construct($level, $bubble);
     }
 
+    /**
+     * Records below the channel level are accepted too while log breadcrumbs are on, so Laravel still
+     * fires MessageLogged for them (it skips the event when no handler wants the level); handle()
+     * then lets them through without capturing them.
+     */
     public function isHandling(LogRecord $record): bool
     {
-        return $this->client->isRecording() && parent::isHandling($record);
+        return $this->client->isRecording() && ($this->client->recordsBreadcrumbs('logs') || parent::isHandling($record));
+    }
+
+    public function handle(LogRecord $record): bool
+    {
+        if (! parent::isHandling($record)) {
+            return false;
+        }
+
+        return parent::handle($record);
     }
 
     protected function write(LogRecord $record): void

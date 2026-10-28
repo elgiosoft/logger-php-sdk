@@ -17,7 +17,8 @@ use Throwable;
 /**
  * Injects the W3C traceparent header into outgoing Laravel HTTP client calls and records
  * an "http.client" span for each of them. With capture.http_client on, the span also carries the
- * request and response bodies and is kept even when the trace is not sampled.
+ * request and response bodies and is kept even when the trace is not sampled. Every call (traced or
+ * not) also leaves an "http" breadcrumb.
  */
 final class HttpClientIntegration
 {
@@ -40,8 +41,12 @@ final class HttpClientIntegration
         return function (RequestInterface $request, array $options) use ($handler): PromiseInterface {
             $tracer = $this->client->tracer();
 
-            if (! $this->client->isRecording() || ! $tracer->hasActiveTrace()) {
+            if (! $this->client->isRecording()) {
                 return $handler($request, $options);
+            }
+
+            if (! $tracer->hasActiveTrace()) {
+                return $this->withBreadcrumb($request, $handler($request, $options));
             }
 
             $span = null;
@@ -82,7 +87,7 @@ final class HttpClientIntegration
                 $this->client->reportFailure('http client tracing failed: '.$exception->getMessage());
             }
 
-            return $handler($request, $options)->then(
+            return $this->withBreadcrumb($request, $handler($request, $options))->then(
                 function (ResponseInterface $response) use ($span, $captures, $options): ResponseInterface {
                     // Streamed downloads and sinks are left alone: reading them would consume the body.
                     if ($span !== null && $captures && empty($options['stream']) && empty($options['sink'])) {
@@ -110,6 +115,42 @@ final class HttpClientIntegration
                 },
             );
         };
+    }
+
+    /**
+     * Record an "http" breadcrumb (method, URL without its query string, status) once the call settles.
+     */
+    private function withBreadcrumb(RequestInterface $request, PromiseInterface $promise): PromiseInterface
+    {
+        if (! $this->client->recordsBreadcrumbs('http_client')) {
+            return $promise;
+        }
+
+        $uri = $request->getUri();
+        $url = $uri->getScheme().'://'.$uri->getHost().($uri->getPort() ? ':'.$uri->getPort() : '').$uri->getPath();
+        $method = $request->getMethod();
+
+        return $promise->then(
+            function (ResponseInterface $response) use ($method, $url): ResponseInterface {
+                $status = $response->getStatusCode();
+                $this->client->addBreadcrumb('http', $method.' '.$url.' '.$status, $status >= 500 ? 'error' : ($status >= 400 ? 'warning' : 'info'), [
+                    'method' => $method,
+                    'url' => $url,
+                    'status_code' => $status,
+                ]);
+
+                return $response;
+            },
+            function (mixed $reason) use ($method, $url): PromiseInterface {
+                $this->client->addBreadcrumb('http', $method.' '.$url.' failed', 'error', [
+                    'method' => $method,
+                    'url' => $url,
+                    'error' => $reason instanceof Throwable ? $reason->getMessage() : 'request failed',
+                ]);
+
+                return Create::rejectionFor($reason);
+            },
+        );
     }
 
     private function finish(?Span $span, ?int $status, bool $keepUnsampled = false): void

@@ -15,6 +15,8 @@ use Illuminate\Support\Facades\Facade;
  * @method static string|null log(string $level, string $message, array<array-key, mixed> $context = [], string|null $event = null)
  * @method static string|null event(string $event, string $message, array<array-key, mixed> $context = [], string $level = 'info')
  * @method static string|null captureException(\Throwable $exception, array<array-key, mixed> $context = [], string $level = 'error')
+ * @method static void addBreadcrumb(string $category, string $message, string $level = 'info', array<array-key, mixed> $data = [])
+ * @method static void clearBreadcrumbs()
  * @method static \Elgiosoft\Logger\Tracing\Span startSpan(string $name, string $op = 'function', array<string, mixed> $attributes = [], string $kind = 'internal')
  * @method static mixed trace(string $name, callable $callback, string $op = 'function', array<string, mixed> $attributes = [])
  * @method static string|null traceId()

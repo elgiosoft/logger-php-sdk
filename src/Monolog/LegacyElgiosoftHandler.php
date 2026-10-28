@@ -30,7 +30,19 @@ final class LegacyElgiosoftHandler extends AbstractProcessingHandler
      */
     public function isHandling(array $record): bool
     {
-        return $this->client->isRecording() && parent::isHandling($record);
+        return $this->client->isRecording() && ($this->client->recordsBreadcrumbs('logs') || parent::isHandling($record));
+    }
+
+    /**
+     * @param  array<string, mixed>  $record
+     */
+    public function handle(array $record): bool
+    {
+        if (! parent::isHandling($record)) {
+            return false;
+        }
+
+        return parent::handle($record);
     }
 
     /**

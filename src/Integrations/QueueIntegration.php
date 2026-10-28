@@ -32,6 +32,7 @@ use Throwable;
  *   instead of the dispatcher's, e.g. to keep a payment's trace across jobs dispatched later.
  * - When a job throws, the worker reports the exception only after the job's trace is restored,
  *   so the trace is remembered on the exception and the error log still links to it.
+ * - Each job starts with an empty breadcrumb buffer (the dispatcher's is restored afterwards).
  */
 final class QueueIntegration
 {
@@ -118,6 +119,16 @@ final class QueueIntegration
             }
 
             $this->client->pushScope();
+            $this->client->clearBreadcrumbs();
+
+            if ($this->client->recordsBreadcrumbs('queue')) {
+                $this->client->addBreadcrumb('queue', 'Processing '.$this->displayName($payload), 'info', [
+                    'queue' => $job->getQueue(),
+                    'connection' => $connectionName,
+                    'attempts' => $job->attempts(),
+                ]);
+            }
+
             $tracer = $this->client->tracer();
             $tracer->saveState();
 

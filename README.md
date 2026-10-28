@@ -40,7 +40,7 @@ The service provider and the `ElgioLogger` facade are auto-discovered.
 # ELGIOSOFT_LOGGER_ENDPOINT=https://elgiologs.com   # default; set only for a local/self-hosted collector
 ELGIOSOFT_LOGGER_KEY=elg_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx   # project key, or one account key shared by all apps
 ELGIOSOFT_LOGGER_SERVICE=checkout      # optional – defaults to APP_NAME; picks the project when using an account key
-ELGIOSOFT_LOGGER_TRANSPORT=queue                                     # queue | deferred | sync
+ELGIOSOFT_LOGGER_TRANSPORT=deferred                                  # deferred (recommended) | queue | sync
 # optional
 ELGIOSOFT_LOGGER_ENVIRONMENT=production      # defaults to APP_ENV
 ELGIOSOFT_LOGGER_RELEASE=2026.10.08-1        # e.g. the git sha / deploy tag
@@ -71,8 +71,9 @@ everywhere (local, CI, ...).
 ],
 ```
 
-That's all you need. Exceptions reported by Laravel's handler go through the log stack, so they
-arrive with their stack trace.
+That's all you need. Exceptions reported by Laravel's handler are also captured directly (see
+*Errors* below), so they arrive with their stack trace even if the `elgiosoft` channel is missing
+from the stack.
 
 Check the setup:
 
@@ -130,6 +131,47 @@ ElgioLogger::flush();              // rarely needed; flushing is automatic
 Scope (user, tags, contexts) lasts for the current request, or for the current job in a worker.
 When nothing is set, the authenticated user's id is attached automatically. Email and name are
 only attached with `ELGIOSOFT_LOGGER_SEND_DEFAULT_PII=true`.
+
+## 3b. Errors: exception capture, breadcrumbs, sampling
+
+**Exception capture.** The SDK registers a `reportable()` callback on Laravel's exception handler
+(works with `bootstrap/app.php` `withExceptions()` on Laravel 11+ and with `App\Exceptions\Handler`
+before). Every exception the handler reports is sent with its stack trace, its handler log level
+(`$exceptions->level(...)`) and context, even when the `elgiosoft` channel is not in your log stack.
+`dontReport`, `shouldReport`, `report()` returning `false` and earlier `reportable` callbacks that stop
+reporting are respected. When the channel *is* in the stack, the handler's log record for the same
+exception is merged into that event: each exception object is sent once. An exception you already
+sent with `ElgioLogger::captureException()` isn't sent again when it is reported.
+Turn the hook off with `ELGIOSOFT_LOGGER_CAPTURE_EXCEPTIONS=false`.
+
+**Breadcrumbs.** Every log of level `error` and above (and every captured exception) carries
+`context.breadcrumbs`: the last 30 things that happened in the current request, queued job or artisan
+command, oldest first:
+
+```json
+{"timestamp": "2026-10-28T09:12:03.120391Z", "category": "query", "level": "info",
+ "message": "select * from wallets where user_id = ?", "data": {"connection": "mysql", "duration_ms": 1.2, "params": [{"name": "user_id", "value": 7}]}}
+```
+
+| Category | Recorded | Switch (`breadcrumbs.*`) |
+|---|---|---|
+| `log` | Every `Log::` record (also those below the channel's level, and when the channel is not in the stack) and `ElgioLogger::log()/event()` | `logs` |
+| `query` | The SQL; bindings only when `ELGIOSOFT_LOGGER_DB_BINDINGS` is on (sensitive columns redacted) | `db_queries` |
+| `http` | Outgoing `Http::`/`GuzzleMiddleware` calls: method, URL without query string, status | `http_client` |
+| `queue` | The job starting (its name, queue, connection, attempt) | `queue` |
+| `console` | The artisan command starting | `console` |
+| `cache` | Cache hits and misses (off by default) | `cache` |
+
+The buffer is emptied when a request starts, when a job starts (the dispatcher's buffer comes back after a
+synchronous job) and when a top-level artisan command starts. Data is redacted with the `redact` keys and
+messages are scrubbed like log messages. Add your own with
+`ElgioLogger::addBreadcrumb('payment', 'Charge sent to MTN', 'info', ['amount' => 5000])`.
+`ELGIOSOFT_LOGGER_MAX_BREADCRUMBS` sets the size (0 turns breadcrumbs off, at most 100).
+
+**Sampling logs and errors.** `ELGIOSOFT_LOGGER_LOGS_SAMPLE_RATE` (default `1.0`) keeps that share of logs
+below `error`; `ELGIOSOFT_LOGGER_ERRORS_SAMPLE_RATE` (default `1.0`) the share of `error` and above. Each
+log is decided on its own, independently of `ELGIOSOFT_LOGGER_SAMPLE_RATE` (tracing): a kept log may
+belong to an unsampled trace and the reverse. Sampled-away logs are still recorded as breadcrumbs.
 
 ## 4. Tracing
 
@@ -210,8 +252,8 @@ place it yourself, set `middleware.auto` to `false` and add
 
 | `ELGIOSOFT_LOGGER_TRANSPORT` | What happens | Use for |
 |---|---|---|
-| `queue` (default) | Buffered events become one `SendBatch` job on **your** queue (Redis). A worker POSTs it to the collector. | Production: requests never wait on the network. |
-| `deferred` | Buffered events are POSTed after the response has been sent (`terminating`). | Apps without a queue worker. |
+| `deferred` (recommended) | Buffered events are POSTed after the response has been sent (`terminating`), and after each queued job. With `ELGIOSOFT_LOGGER_TIMEOUT=1` a slow collector costs at most ~1 s of a PHP process, never a queue. | Production. |
+| `queue` (default) | Buffered events become one `SendBatch` job on **your** queue (Redis). A worker POSTs it to the collector. | Only with a dedicated queue and worker. |
 | `sync` | Every event is POSTed immediately. | Tests, debugging, one-off CLI scripts. |
 
 The buffer is flushed when:
@@ -223,21 +265,98 @@ The buffer is flushed when:
 - the buffer reaches `max_buffer` (200) events
 - the PHP process shuts down
 
-Queue mode notes:
+Recommended production settings:
+
+```dotenv
+ELGIOSOFT_LOGGER_TRANSPORT=deferred
+ELGIOSOFT_LOGGER_TIMEOUT=1
+ELGIOSOFT_LOGGER_MAX_BUFFER=1000      # flushing mid-request would make that user wait
+ELGIOSOFT_LOGGER_SAMPLE_RATE=0.1
+ELGIOSOFT_LOGGER_DB_RESULTS=false
+ELGIOSOFT_LOGGER_DB_BINDINGS=false
+ELGIOSOFT_LOGGER_LEVEL=info
+```
+
+**Delivery failures (deferred and sync).** Connection errors, timeouts, `5xx`, `408` and `429` are
+retried with exponential backoff and jitter within a small budget: `deferred` retries twice within 3 s
+(it runs after the response), `sync` doesn't retry (it must stay fast). A `429`'s `Retry-After` is
+honoured: the SDK never retries sooner, and if the wait is longer than the budget it goes straight to
+the fallback. A `413` (batch too large) splits the batch in half and sends each half. Other `4xx`
+answers (bad key, invalid payload) are reported and the batch dropped.
+
+A batch that still could not be delivered goes to the fallback:
+
+- the queue, as a `SendBatch` job, **only** when `ELGIOSOFT_LOGGER_QUEUE_CONNECTION` is set to a real
+  (non-`sync`) connection;
+- otherwise the **local spool**: one JSON file per batch in `storage/framework/elgiosoft-logger`
+  (`ELGIOSOFT_LOGGER_SPOOL_PATH`). The next successful send of any PHP process resends up to 5 spooled
+  batches. At most `ELGIOSOFT_LOGGER_SPOOL_MAX_FILES` (100) files are kept and files older than
+  `ELGIOSOFT_LOGGER_SPOOL_MAX_AGE` (86400 s) are dropped. `ELGIOSOFT_LOGGER_SPOOL=false` drops the batch
+  instead. Every fallback is reported to the fallback channel / `error_log`.
+
+Tune the retries with `ELGIOSOFT_LOGGER_RETRIES` and `ELGIOSOFT_LOGGER_RETRY_BUDGET` (seconds).
+
+Queue mode notes (a job per request, per job and per 200 queries — on a busy app this floods the queue; on
+2026-10-08 it delayed Yankap's payment jobs by an hour):
 
 - Run a worker for the queue: `php artisan queue:work redis --queue=logs,default`.
-- If the collector is unreachable, `SendBatch` releases itself with backoff
-  (`ELGIOSOFT_LOGGER_QUEUE_TRIES`, default 3) and then drops the batch. It never throws, because a
-  thrown exception would be logged and generate yet another batch.
+- If the collector is unreachable or answers `5xx`/`408`, `SendBatch` releases itself with backoff and
+  jitter (10–20 s, then 20–40 s, …); on a `429` it is released for the `Retry-After` delay. After
+  `ELGIOSOFT_LOGGER_QUEUE_TRIES` (default 3) attempts the batch is dropped. A `413` splits it into two
+  jobs; other `4xx` answers drop it at once. It never throws, because a thrown exception would be logged
+  and generate yet another batch.
 - If you use Horizon, give the `logs` queue its own small supervisor.
+
+## 5b. Payload capture (webhooks, provider calls)
+
+Off by default. Useful to see exactly what a payment provider sent to a webhook, or what it answered:
+
+```dotenv
+ELGIOSOFT_LOGGER_CAPTURE_PATHS="webhooks/*,api/callbacks/*"   # incoming: headers, query, request + response body
+ELGIOSOFT_LOGGER_CAPTURE_HTTP_CLIENT=true                     # outgoing: request + response body of every call
+ELGIOSOFT_LOGGER_CAPTURE_MAX_BYTES=16384
+```
+
+- Incoming captures go on the request's `http.server` span (`http.request.headers`, `http.request.query`,
+  `http.request.body`, `http.response.body`); outgoing ones on `http.client` spans, which are then kept even when the
+  trace isn't sampled. The dashboard shows them as "Request & response" on the span.
+- JSON and form bodies are kept as objects, so the `redact` keys are masked at any depth; XML and text bodies get
+  `key=value`, `"key": "value"` and `<key>value</key>` masked. Cookies, `Authorization` and other credential headers
+  are dropped. Binary bodies are only described; anything above the limit is cut.
+- Phone numbers, amounts and names are **not** masked — only enable capture where you need those payloads.
+- Outgoing capture needs Laravel 10+ for the HTTP client; `GuzzleMiddleware` works everywhere.
 
 ## 6. Data protection
 
 - Values of keys like `password`, `pin`, `otp`, `token`, `secret`, `authorization`, `card_number`,
   `cvv`, `api_key`... are replaced with `[Filtered]` at any depth. The match ignores case and
   `_`/`-`, so `cardNumber` matches too. Extend the list in `redact`.
-- Request bodies, headers, cookies and query strings are never sent. URLs are sent without their query string.
+- By default request bodies, headers, cookies and query strings are never sent, and URLs are sent without their
+  query string. Payload capture (below) changes that only for the paths and calls you choose.
 - The client IP and the user's email/name are only sent with `send_default_pii=true`.
+- Log messages, exception messages and breadcrumb messages are scrubbed (`ELGIOSOFT_LOGGER_SCRUB_MESSAGES`,
+  default `true`): values of the `redact` keys written as `key=value`, `key: value`, `"key": "value"` or
+  `<key>value</key>` (SQL placeholders such as `pin = ?` are left alone), `Bearer`/`Basic` credentials,
+  card numbers (13–19 digits starting with 2–6, spaces/dashes allowed, Luhn-checked) and, unless
+  `send_default_pii` is on, e-mail addresses. Context values are protected by key, as above.
+
+### New configuration keys
+
+| Key | Env var | Default |
+|---|---|---|
+| `capture_exceptions` | `ELGIOSOFT_LOGGER_CAPTURE_EXCEPTIONS` | `true` |
+| `logs_sample_rate` | `ELGIOSOFT_LOGGER_LOGS_SAMPLE_RATE` | `1.0` |
+| `errors_sample_rate` | `ELGIOSOFT_LOGGER_ERRORS_SAMPLE_RATE` | `1.0` |
+| `breadcrumbs.max` | `ELGIOSOFT_LOGGER_MAX_BREADCRUMBS` | `30` |
+| `breadcrumbs.logs` / `db_queries` / `http_client` / `queue` / `console` / `cache` | – | `true` (cache `false`) |
+| `retry.max_retries` | `ELGIOSOFT_LOGGER_RETRIES` | deferred `2`, sync `0` |
+| `retry.budget` | `ELGIOSOFT_LOGGER_RETRY_BUDGET` | deferred `3` s, sync `0.5` s |
+| `spool.enabled` | `ELGIOSOFT_LOGGER_SPOOL` | `true` |
+| `spool.path` | `ELGIOSOFT_LOGGER_SPOOL_PATH` | `storage/framework/elgiosoft-logger` |
+| `spool.max_files` | `ELGIOSOFT_LOGGER_SPOOL_MAX_FILES` | `100` |
+| `spool.max_age` | `ELGIOSOFT_LOGGER_SPOOL_MAX_AGE` | `86400` |
+| `spool.replay_batches` | – | `5` |
+| `scrub_messages` | `ELGIOSOFT_LOGGER_SCRUB_MESSAGES` | `true` |
 
 ## 7. Troubleshooting
 
@@ -247,6 +366,7 @@ Queue mode notes:
 | Works in `test` but not in the app | In `queue` mode a worker must consume `ELGIOSOFT_LOGGER_QUEUE`. Is the channel in your `stack`? |
 | `401 Invalid API key` | The key was revoked or belongs to another environment. Create a new one in the dashboard. |
 | SDK errors | Written to PHP's `error_log` with the prefix `[elgiosoft-logger]`, or to `ELGIOSOFT_LOGGER_FALLBACK_CHANNEL`. Never point the fallback at a stack that contains `elgiosoft`. |
+| Files piling up in `storage/framework/elgiosoft-logger` | The collector has been unreachable or rate limiting; they are resent once it answers again. Check the fallback channel for the reason. |
 | Too many `db.query` spans | Raise `ELGIOSOFT_LOGGER_DB_MIN_DURATION_MS` or set `tracing.db_queries` to `false`. |
 | Disable everywhere quickly | `ELGIOSOFT_LOGGER_ENABLED=false` |
 

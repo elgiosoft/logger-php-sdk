@@ -6,6 +6,7 @@ namespace Elgiosoft\Logger\Tests;
 
 use Elgiosoft\Logger\Client;
 use Elgiosoft\Logger\LoggerServiceProvider;
+use Elgiosoft\Logger\Transport\HttpTransport;
 use Illuminate\Http\Client\Request;
 use Illuminate\Support\Facades\Http;
 use Monolog\Handler\TestHandler;
@@ -16,6 +17,46 @@ abstract class TestCase extends Orchestra
     public const ENDPOINT = 'https://logger.test';
 
     public const KEY = 'elg_test_0123456789abcdef0123456789abcdef0123';
+
+    /**
+     * Delays the HTTP transport asked to sleep for between retries (nothing really sleeps in tests).
+     *
+     * @var list<float>
+     */
+    protected array $sleeps = [];
+
+    protected function setUp(): void
+    {
+        $this->sleeps = [];
+        HttpTransport::sleepUsing(function (float $seconds): void {
+            $this->sleeps[] = $seconds;
+        });
+        $this->clearSpool();
+
+        parent::setUp();
+    }
+
+    protected function tearDown(): void
+    {
+        parent::tearDown();
+
+        HttpTransport::sleepUsing(null);
+        $this->clearSpool();
+    }
+
+    protected static function spoolPath(): string
+    {
+        return sys_get_temp_dir().'/elgiosoft-logger-tests-'.getmypid();
+    }
+
+    protected function clearSpool(): void
+    {
+        foreach (glob(self::spoolPath().'/*') ?: [] as $file) {
+            @unlink($file);
+        }
+
+        @rmdir(self::spoolPath());
+    }
 
     /**
      * @return list<class-string>
@@ -37,6 +78,7 @@ abstract class TestCase extends Orchestra
         $app['config']->set('elgiosoft-logger.in_app_paths', [dirname(__DIR__)]);
         $app['config']->set('elgiosoft-logger.in_app_exclude', ['/vendor/']);
         $app['config']->set('elgiosoft-logger.fallback_channel', 'fallback');
+        $app['config']->set('elgiosoft-logger.spool.path', self::spoolPath());
 
         $app['config']->set('logging.default', 'elgiosoft');
         $app['config']->set('logging.channels.elgiosoft', ['driver' => 'elgiosoft', 'level' => 'debug']);

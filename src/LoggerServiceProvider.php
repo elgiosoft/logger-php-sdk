@@ -7,6 +7,7 @@ namespace Elgiosoft\Logger;
 use Elgiosoft\Logger\Console\InstallCommand;
 use Elgiosoft\Logger\Console\TestCommand;
 use Elgiosoft\Logger\Http\Middleware\TraceRequests;
+use Elgiosoft\Logger\Integrations\BreadcrumbIntegration;
 use Elgiosoft\Logger\Integrations\CacheIntegration;
 use Elgiosoft\Logger\Integrations\ConsoleIntegration;
 use Elgiosoft\Logger\Integrations\DatabaseIntegration;
@@ -19,7 +20,9 @@ use Elgiosoft\Logger\Support\BodyCapture;
 use Elgiosoft\Logger\Support\Redactor;
 use Elgiosoft\Logger\Transport\HttpTransport;
 use Elgiosoft\Logger\Transport\QueueTransport;
+use Elgiosoft\Logger\Transport\Spool;
 use Illuminate\Contracts\Bus\Dispatcher as BusDispatcher;
+use Illuminate\Contracts\Debug\ExceptionHandler;
 use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Contracts\Foundation\Application;
 use Illuminate\Contracts\Http\Kernel as HttpKernel;
@@ -40,10 +43,22 @@ final class LoggerServiceProvider extends ServiceProvider
             DatabaseIntegration::registerConnections();
         }
 
-        $this->app->singleton(HttpTransport::class, fn (Application $app): HttpTransport => new HttpTransport(
-            $this->config($app),
-            fn (string $message) => $app->make(Client::class)->reportFailure($message),
-        ));
+        $this->app->singleton(HttpTransport::class, function (Application $app): HttpTransport {
+            $config = $this->config($app);
+            $onFailure = fn (string $message) => $app->make(Client::class)->reportFailure($message);
+
+            // In queue mode the SendBatch job retries by itself: no fallback needed.
+            if ($config['transport'] === 'queue') {
+                return new HttpTransport($config, $onFailure);
+            }
+
+            return new HttpTransport(
+                $config,
+                $onFailure,
+                $config['spool']['enabled'] ? new Spool($config['spool']['path'], $config['spool']['max_files'], $config['spool']['max_age']) : null,
+                $this->fallbackQueue($app, $config, $onFailure),
+            );
+        });
 
         $this->app->singleton(Client::class, function (Application $app): Client {
             $config = $this->config($app);
@@ -62,7 +77,7 @@ final class LoggerServiceProvider extends ServiceProvider
                     (int) $config['context_lines'],
                 ),
                 new Normalizer,
-                new Redactor((array) $config['redact']),
+                new Redactor((array) $config['redact'], ! $config['send_default_pii']),
                 $this->userResolver($app, (bool) $config['send_default_pii']),
                 $this->failureReporter($app, $config['fallback_channel'] ?? null),
             );
@@ -78,6 +93,10 @@ final class LoggerServiceProvider extends ServiceProvider
 
         $this->callAfterResolving('log', function (LogManager $log): void {
             $log->extend('elgiosoft', fn (Application $app, array $config) => (new CreateElgiosoftLogger)($app, $config));
+        });
+
+        $this->callAfterResolving(ExceptionHandler::class, function (ExceptionHandler $handler, Application $app): void {
+            $this->hookExceptionHandler($handler, $app);
         });
     }
 
@@ -113,6 +132,7 @@ final class LoggerServiceProvider extends ServiceProvider
         });
 
         (new QueueIntegration($client))->register($events);
+        (new BreadcrumbIntegration($client, $this->app->runningInConsole()))->register($events);
 
         if ($tracing && $config['tracing']['db_queries']) {
             $database = new DatabaseIntegration($client);
@@ -171,6 +191,86 @@ final class LoggerServiceProvider extends ServiceProvider
     }
 
     /**
+     * Capture exceptions reported through Laravel's handler even when the "elgiosoft" channel is not in the
+     * log stack. The handler only calls reportable callbacks for exceptions it reports (dontReport,
+     * shouldReport and report() returning false are respected); the Client sends each exception once
+     * when the channel then logs it too.
+     */
+    private function hookExceptionHandler(ExceptionHandler $handler, Application $app): void
+    {
+        if (! method_exists($handler, 'reportable')) {
+            return;
+        }
+
+        $handler->reportable(function (Throwable $exception) use ($handler, $app): void {
+            try {
+                $config = $this->config($app);
+
+                if (! $config['enabled'] || ! $config['capture_exceptions']) {
+                    return;
+                }
+
+                $client = $app->make(Client::class);
+
+                if (! $client->isRecording()) {
+                    return;
+                }
+
+                [$level, $context] = $client->withoutRecording(fn (): array => $this->handlerLevelAndContext($handler, $exception));
+                $client->captureReportedException($exception, $context, $level);
+            } catch (Throwable) {
+                // Never break the application's error reporting.
+            }
+        });
+    }
+
+    /**
+     * The log level and context Laravel's handler would log the exception with (its protected
+     * mapLogLevel() / buildExceptionContext(), when available).
+     *
+     * @return array{0: string, 1: array<array-key, mixed>}
+     */
+    private function handlerLevelAndContext(ExceptionHandler $handler, Throwable $exception): array
+    {
+        $read = function (Throwable $exception): array {
+            $level = method_exists($this, 'mapLogLevel') ? $this->mapLogLevel($exception) : 'error';
+            $context = method_exists($this, 'buildExceptionContext') ? $this->buildExceptionContext($exception) : [];
+
+            return [is_string($level) ? $level : 'error', is_array($context) ? $context : []];
+        };
+
+        try {
+            return \Closure::bind($read, $handler, $handler::class)($exception);
+        } catch (Throwable) {
+            return ['error', []];
+        }
+    }
+
+    /**
+     * The queue transport used as the fallback of the HTTP modes: only when a queue connection is set
+     * explicitly for the SDK (ELGIOSOFT_LOGGER_QUEUE_CONNECTION) and it is a real queue (not "sync").
+     *
+     * @param  array<string, mixed>  $config
+     * @param  \Closure(string): void  $onFailure
+     */
+    private function fallbackQueue(Application $app, array $config, \Closure $onFailure): ?QueueTransport
+    {
+        $connection = $config['queue']['connection'] ?? null;
+
+        if (! is_string($connection) || $connection === '') {
+            return null;
+        }
+
+        $driver = $app['config']->get("queue.connections.{$connection}.driver");
+
+        if ($driver === null || in_array($driver, ['sync', 'null'], true)) {
+            return null;
+        }
+
+        return new QueueTransport($app->make(BusDispatcher::class), $config, $onFailure);
+    }
+
+    /**
      * @param  array<string, mixed>  $config
      */
     private function capturesQueryResults(array $config): bool
@@ -209,6 +309,30 @@ final class LoggerServiceProvider extends ServiceProvider
             'max_body_bytes' => max(256, (int) ($capture['max_body_bytes'] ?? 16384)),
         ];
         $config['middleware'] = (array) ($config['middleware'] ?? []) + ['auto' => true];
+        $config['capture_exceptions'] = filter_var($config['capture_exceptions'] ?? true, FILTER_VALIDATE_BOOLEAN);
+        $config['scrub_messages'] = filter_var($config['scrub_messages'] ?? true, FILTER_VALIDATE_BOOLEAN);
+        $config['logs_sample_rate'] = self::rate($config['logs_sample_rate'] ?? 1.0);
+        $config['errors_sample_rate'] = self::rate($config['errors_sample_rate'] ?? 1.0);
+        $breadcrumbs = (array) ($config['breadcrumbs'] ?? []);
+        $config['breadcrumbs'] = ['max' => max(0, min(100, (int) ($breadcrumbs['max'] ?? 30)))];
+
+        foreach (['logs' => true, 'db_queries' => true, 'http_client' => true, 'cache' => false, 'queue' => true, 'console' => true] as $source => $default) {
+            $config['breadcrumbs'][$source] = filter_var($breadcrumbs[$source] ?? $default, FILTER_VALIDATE_BOOLEAN);
+        }
+
+        $retry = (array) ($config['retry'] ?? []);
+        $config['retry'] = [
+            'max_retries' => isset($retry['max_retries']) && $retry['max_retries'] !== '' ? max(0, (int) $retry['max_retries']) : null,
+            'budget' => isset($retry['budget']) && $retry['budget'] !== '' ? max(0.0, (float) $retry['budget']) : null,
+        ];
+        $spool = (array) ($config['spool'] ?? []);
+        $config['spool'] = [
+            'enabled' => filter_var($spool['enabled'] ?? true, FILTER_VALIDATE_BOOLEAN),
+            'path' => (string) (($spool['path'] ?? null) ?: $app->storagePath().'/framework/elgiosoft-logger'),
+            'max_files' => max(1, (int) ($spool['max_files'] ?? 100)),
+            'max_age' => max(60, (int) ($spool['max_age'] ?? 86400)),
+            'replay_batches' => max(0, (int) ($spool['replay_batches'] ?? 5)),
+        ];
         $config['transport'] = in_array($config['transport'] ?? 'queue', ['queue', 'deferred', 'sync'], true) ? $config['transport'] : 'queue';
         $config['in_app_paths'] = array_values(array_filter((array) ($config['in_app_paths'] ?? [])));
         $config['in_app_exclude'] ??= ['/vendor/'];
@@ -216,6 +340,11 @@ final class LoggerServiceProvider extends ServiceProvider
         $config['redact'] ??= [];
 
         return $config;
+    }
+
+    private static function rate(mixed $value): float
+    {
+        return is_numeric($value) ? max(0.0, min(1.0, (float) $value)) : 1.0;
     }
 
     /**

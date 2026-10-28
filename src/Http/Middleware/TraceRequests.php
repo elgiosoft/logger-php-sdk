@@ -31,6 +31,7 @@ final class TraceRequests
 
         $config = $this->client->config();
         $tracer = $this->client->tracer();
+        $this->client->clearBreadcrumbs();
         $traceId = $tracer->startTrace($request->headers->get('traceparent'));
         $requestId = $this->requestId($request);
 

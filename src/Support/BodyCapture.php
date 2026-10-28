@@ -138,10 +138,6 @@ final class BodyCapture
      */
     private function maskText(string $text): string
     {
-        $mask = fn (string $key, string $value): string => $this->redactor->isSensitive($key) ? Redactor::FILTERED : $value;
-
-        $text = (string) preg_replace_callback('/(["\']?)([A-Za-z0-9_.\-]+)\1(\s*[:=]\s*)(["\']?)([^"\'&\s,}<]*)\4/', fn (array $m): string => $m[1].$m[2].$m[1].$m[3].$m[4].$mask($m[2], $m[5]).$m[4], $text);
-
-        return (string) preg_replace_callback('/<([A-Za-z0-9_:\-]+)(\s[^>]*)?>([^<]*)<\/\1>/', fn (array $m): string => '<'.$m[1].($m[2] ?? '').'>'.$mask($m[1], $m[3]).'</'.$m[1].'>', $text);
+        return $this->redactor->maskKeyValues($text);
     }
 }

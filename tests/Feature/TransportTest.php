@@ -147,7 +147,8 @@ final class TransportTest extends TestCase
         Log::error('collector is broken');
         $this->client()->flush();
 
-        $this->assertCount(1, $this->sentEnvelopes());
+        // The first attempt and the two retries of the deferred mode.
+        $this->assertCount(3, $this->sentEnvelopes());
         $this->assertTrue($this->fallbackHandler()->hasWarningThatContains('collector responded 500'));
     }
 
@@ -172,7 +173,7 @@ final class TransportTest extends TestCase
         Log::error('first');
         $this->client()->flush();
 
-        $this->assertCount(1, $this->sentEnvelopes());
+        $this->assertCount(3, $this->sentEnvelopes());
         $this->assertSame([], $this->client()->pendingLogs());
     }
 

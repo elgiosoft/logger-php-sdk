@@ -35,6 +35,60 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Error capture and sampling
+    |--------------------------------------------------------------------------
+    |
+    | capture_exceptions hooks into Laravel's exception handler, so every reported
+    | exception is sent even when the "elgiosoft" channel is not in your log stack.
+    | dontReport / shouldReport are respected, and an exception that also reaches
+    | the channel is sent once.
+    |
+    | logs_sample_rate applies to logs below "error", errors_sample_rate to "error"
+    | and above (1.0 = keep all, 0.0 = keep none). They are independent of
+    | tracing.sample_rate: a kept log may belong to an unsampled trace and the
+    | reverse. Sampled-away logs still appear as breadcrumbs.
+    |
+    */
+
+    'capture_exceptions' => env('ELGIOSOFT_LOGGER_CAPTURE_EXCEPTIONS', true),
+
+    'logs_sample_rate' => (float) env('ELGIOSOFT_LOGGER_LOGS_SAMPLE_RATE', 1.0),
+
+    'errors_sample_rate' => (float) env('ELGIOSOFT_LOGGER_ERRORS_SAMPLE_RATE', 1.0),
+
+    /*
+    |--------------------------------------------------------------------------
+    | Breadcrumbs
+    |--------------------------------------------------------------------------
+    |
+    | The last "max" events of the current request / queued job / command, sent
+    | as context.breadcrumbs (oldest first) on every log of level "error" and up.
+    | Each is {timestamp, category, message, level, data?}; data is redacted and
+    | messages scrubbed like logs. 0 turns breadcrumbs off.
+    |
+    */
+
+    'breadcrumbs' => [
+        'max' => (int) env('ELGIOSOFT_LOGGER_MAX_BREADCRUMBS', 30),
+
+        // Every log record through Laravel's logger, including those below the channel level.
+        'logs' => true,
+
+        // The SQL; its bindings only when tracing.db_bindings is on (sensitive columns redacted).
+        'db_queries' => true,
+
+        // Method, URL without its query string, status.
+        'http_client' => true,
+
+        // Cache hits and misses (noisy, off by default).
+        'cache' => false,
+
+        'queue' => true,
+        'console' => true,
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
     | Transport
     |--------------------------------------------------------------------------
     |
@@ -47,14 +101,36 @@ return [
 
     'transport' => env('ELGIOSOFT_LOGGER_TRANSPORT', 'queue'),
 
+    // Also used by deferred / sync as the fallback for failed batches when the connection is set.
     'queue' => [
         'connection' => env('ELGIOSOFT_LOGGER_QUEUE_CONNECTION'),
         'queue' => env('ELGIOSOFT_LOGGER_QUEUE', 'default'),
         'tries' => (int) env('ELGIOSOFT_LOGGER_QUEUE_TRIES', 3),
     ],
 
-    // Seconds. The SDK never waits longer than this for the collector.
+    // Seconds. The SDK never waits longer than this for one request to the collector.
     'timeout' => (float) env('ELGIOSOFT_LOGGER_TIMEOUT', 2),
+
+    // deferred / sync: connection errors, timeouts, 5xx, 408 and 429 are retried with exponential
+    // backoff and jitter while both limits allow (never sooner than a 429's Retry-After). Null keeps
+    // the mode's default: deferred 2 retries within 3 s, sync no retry (within 0.5 s if you set some).
+    // Queue mode retries by releasing the job instead (queue.tries).
+    'retry' => [
+        'max_retries' => env('ELGIOSOFT_LOGGER_RETRIES'),
+        'budget' => env('ELGIOSOFT_LOGGER_RETRY_BUDGET'),
+    ],
+
+    // deferred / sync: where a batch goes when it still could not be delivered. With
+    // ELGIOSOFT_LOGGER_QUEUE_CONNECTION set (to a non-sync queue) it becomes a SendBatch job; otherwise
+    // it is written to this directory and resent by the next successful send of any process
+    // (replay_batches at a time). Batches older than max_age seconds or beyond max_files are dropped.
+    'spool' => [
+        'enabled' => env('ELGIOSOFT_LOGGER_SPOOL', true),
+        'path' => env('ELGIOSOFT_LOGGER_SPOOL_PATH'), // default: storage/framework/elgiosoft-logger
+        'max_files' => (int) env('ELGIOSOFT_LOGGER_SPOOL_MAX_FILES', 100),
+        'max_age' => (int) env('ELGIOSOFT_LOGGER_SPOOL_MAX_AGE', 86400),
+        'replay_batches' => 5,
+    ],
 
     'compress' => env('ELGIOSOFT_LOGGER_COMPRESS', true),
 
@@ -170,6 +246,11 @@ return [
     */
 
     'send_default_pii' => env('ELGIOSOFT_LOGGER_SEND_DEFAULT_PII', false),
+
+    // Mask secrets in log messages, exception messages and breadcrumbs: values of the "redact" keys
+    // written as key=value / key: value / "key": "value" / <key>value</key>, Bearer/Basic credentials,
+    // Luhn-valid card numbers and, unless send_default_pii is on, e-mail addresses.
+    'scrub_messages' => env('ELGIOSOFT_LOGGER_SCRUB_MESSAGES', true),
 
     // Matched case-insensitively, ignoring "_", "-" and spaces, at any depth.
     'redact' => [

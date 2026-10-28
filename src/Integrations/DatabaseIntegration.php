@@ -10,8 +10,7 @@ use Elgiosoft\Logger\Database\TracedMySqlConnection;
 use Elgiosoft\Logger\Database\TracedPostgresConnection;
 use Elgiosoft\Logger\Database\TracedSQLiteConnection;
 use Elgiosoft\Logger\Database\TracedSqlServerConnection;
-use Elgiosoft\Logger\Support\BindingNames;
-use Elgiosoft\Logger\Support\Redactor;
+use Elgiosoft\Logger\Support\QueryParams;
 use Elgiosoft\Logger\Support\Time;
 use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Database\Connection;
@@ -95,7 +94,7 @@ final class DatabaseIntegration
             ];
 
             if (($tracing['db_bindings'] ?? true) && $query->bindings !== []) {
-                $attributes['db.params'] = $this->params($query->sql, $connection->prepareBindings($query->bindings));
+                $attributes['db.params'] = QueryParams::from($query->sql, $connection->prepareBindings($query->bindings), $this->client->redactor());
             }
 
             $span = $tracer->recordSpan(
@@ -167,41 +166,5 @@ final class DatabaseIntegration
         unset($this->lastSpan[$connectionName]);
 
         return $spanId;
-    }
-
-    /**
-     * @param  array<int|string, mixed>  $bindings
-     * @return list<array{name: ?string, value: mixed}>
-     */
-    private function params(string $sql, array $bindings): array
-    {
-        $bindings = array_values($bindings);
-        $names = BindingNames::infer($sql, count($bindings));
-        $redactor = $this->client->redactor();
-        $params = [];
-
-        foreach (array_slice($bindings, 0, 100) as $index => $value) {
-            $name = $names[$index] ?? null;
-
-            if (($name !== null && $redactor->isSensitive($name)) || $this->looksSecret($value)) {
-                $value = Redactor::FILTERED;
-            } elseif (is_string($value)) {
-                $value = mb_check_encoding($value, 'UTF-8') ? mb_substr($value, 0, 500) : '[binary]';
-            } elseif (! is_scalar($value) && $value !== null) {
-                $value = get_debug_type($value);
-            }
-
-            $params[] = ['name' => $name, 'value' => $value];
-        }
-
-        return $params;
-    }
-
-    /**
-     * Password hashes are secrets even when the column name is unknown.
-     */
-    private function looksSecret(mixed $value): bool
-    {
-        return is_string($value) && preg_match('/^\$(2[aby]|argon2i|argon2id)\$/', $value) === 1;
     }
 }
